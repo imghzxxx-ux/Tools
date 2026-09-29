@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Image Downloader MVP
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  Quét ảnh trên trang, chọn/bỏ chọn, tải về
 // @match        *://*/*
 // @grant        GM_download
@@ -10,6 +10,8 @@
 
 (function () {
     'use strict';
+
+    const MIN_SIZE = 100; // px — ảnh nhỏ hơn coi như rác (pixel, spacer, LQIP)
 
     // ===== CSS =====
     const style = document.createElement('style');
@@ -193,18 +195,63 @@
     let allImages = [];
 
     // ===== Helpers =====
+
+    // Lấy URL ảnh thật của 1 thẻ <img>, ưu tiên data-src (ảnh gốc lazy-load)
+    function pickRealSrc(img) {
+        const lazyAttrs = ['data-src', 'data-original', 'data-lazy-src', 'data-srcset'];
+        for (const attr of lazyAttrs) {
+            const v = img.getAttribute(attr);
+            if (v && v.startsWith('http')) return v;
+        }
+        // srcset: lấy URL cuối (thường là lớn nhất)
+        const srcset = img.getAttribute('srcset');
+        if (srcset) {
+            const last = srcset.split(',').pop().trim().split(/\s+/)[0];
+            if (last && last.startsWith('http')) return last;
+        }
+        const src = img.currentSrc || img.src;
+        if (src && src.startsWith('http')) return src;
+        return null;
+    }
+
+    // Force load ảnh lazy trước khi quét
+    async function forceLoadImages() {
+        const imgs = [...document.querySelectorAll('img')];
+        for (const img of imgs) {
+            // gán src từ data-src nếu chưa load
+            const lazy = img.getAttribute('data-src')
+                      || img.getAttribute('data-original')
+                      || img.getAttribute('data-lazy-src');
+            const currentSrc = img.currentSrc || img.src || '';
+            if (lazy && lazy.startsWith('http') && (!currentSrc || currentSrc === 'about:blank')) {
+                try { img.src = lazy; } catch {}
+            }
+            // đợi browser decode xong
+            if (img.decode) {
+                try { await img.decode(); } catch {}
+            } else if (!img.complete) {
+                await new Promise(r => {
+                    img.addEventListener('load', r, { once: true });
+                    img.addEventListener('error', r, { once: true });
+                    setTimeout(r, 1500);
+                });
+            }
+        }
+    }
+
     function collectImages() {
         const set = new Set();
+
         document.querySelectorAll('img').forEach(img => {
-            const src = img.currentSrc || img.src;
-            if (src && !src.startsWith('data:') && src.startsWith('http')) {
-                set.add(src);
-            }
-            ['data-src', 'data-original', 'data-lazy-src'].forEach(attr => {
-                const v = img.getAttribute(attr);
-                if (v && v.startsWith('http')) set.add(v);
-            });
+            const w = img.naturalWidth || 0;
+            const h = img.naturalHeight || 0;
+            // loại ảnh chưa load, ảnh 1x1, LQIP, spacer, pixel tracking
+            if (w < MIN_SIZE || h < MIN_SIZE) return;
+
+            const real = pickRealSrc(img);
+            if (real) set.add(real);
         });
+
         return [...set];
     }
 
@@ -300,7 +347,6 @@
                         });
                     });
                 } else {
-                    // fallback: fetch blob rồi tải
                     const res = await fetch(url);
                     const blob = await res.blob();
                     const a = document.createElement('a');
@@ -335,7 +381,9 @@
     panel.querySelector('#imgdl-rescan').addEventListener('click', scan);
     panel.querySelector('#imgdl-download').addEventListener('click', downloadSelected);
 
-    function scan() {
+    async function scan() {
+        setProgress('Đang quét...');
+        await forceLoadImages();
         allImages = collectImages();
         selected.clear();
         allImages.forEach(u => selected.add(u));
