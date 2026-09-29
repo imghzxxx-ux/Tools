@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Image Downloader MVP
 // @namespace    http://tampermonkey.net/
-// @version      2.4
-// @description  Quét ảnh, chọn, tải về / ZIP, settings, đa chọn, FAB đẹp, drag, log
+// @version      2.5
+// @description  Quét ảnh, chọn, tải về / ZIP, settings, đa chọn, FAB đẹp, drag, log chi tiết
 // @match        *://*/*
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
@@ -541,7 +541,7 @@
         }
         .imgdl-log-box {
             height: 200px !important;
-            overflow-y: auto !important;
+            overflow: auto !important;
             background: #1e1e1e !important;
             color: #d4d4d4 !important;
             border-radius: 8px !important;
@@ -551,15 +551,21 @@
             line-height: 1.5 !important;
             box-sizing: border-box !important;
             border: 1px solid #333 !important;
+            white-space: nowrap !important;
         }
         .imgdl-log-row {
-            display: flex !important; gap: 6px !important;
+            display: flex !important;
+            gap: 6px !important;
             padding: 1px 0 !important;
             align-items: flex-start !important;
-            word-break: break-word !important;
+            white-space: nowrap !important;
+            width: max-content !important;
+            min-width: 100% !important;
         }
         .imgdl-log-time {
-            color: #666 !important; flex-shrink: 0 !important;
+            color: #666 !important;
+            flex-shrink: 0 !important;
+            font-variant-numeric: tabular-nums !important;
         }
         .imgdl-log-level {
             flex-shrink: 0 !important;
@@ -567,9 +573,8 @@
             min-width: 52px !important;
         }
         .imgdl-log-msg {
-            flex: 1 !important;
-            white-space: pre-wrap !important;
-            word-break: break-word !important;
+            flex-shrink: 0 !important;
+            white-space: pre !important;
         }
         .imgdl-log-info    .imgdl-log-level { color: #4fc3f7 !important; }
         .imgdl-log-success .imgdl-log-level { color: #4caf50 !important; }
@@ -699,7 +704,7 @@
                         </label>
                     </div>
                     <div id="imgdl-log-box" class="imgdl-log-box"></div>
-                    <div class="imgdl-hint">Tối đa 500 dòng gần nhất.</div>
+                    <div class="imgdl-hint">Tối đa 500 dòng gần nhất. Cuộn ngang để xem dòng dài.</div>
                 </div>
             </div>
         </div>
@@ -912,21 +917,38 @@
         } catch { return ''; }
     }
 
+    function fmtSize(bytes) {
+        if (!bytes) return '0B';
+        if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(2) + 'MB';
+        if (bytes >= 1024) return (bytes / 1024).toFixed(1) + 'KB';
+        return bytes + 'B';
+    }
+
     async function forceLoadImages() {
         const imgs = [...document.querySelectorAll('img')];
-        logInfo(`forceLoad: ${imgs.length} thẻ <img> trong DOM`);
+        logInfo(`forceLoad: bắt đầu xử lý ${imgs.length} thẻ <img>`);
         let loaded = 0, failed = 0, patched = 0;
-        for (const img of imgs) {
+
+        for (let i = 0; i < imgs.length; i++) {
+            const img = imgs[i];
             const lazy = img.getAttribute('data-src')
                       || img.getAttribute('data-original')
                       || img.getAttribute('data-lazy-src');
             const currentSrc = img.currentSrc || img.src || '';
+
             if (lazy && lazy.startsWith('http') && (!currentSrc || currentSrc === 'about:blank')) {
-                try { img.src = lazy; patched++; } catch {}
+                try {
+                    img.src = lazy;
+                    patched++;
+                    logInfo(`#${i} PATCH data-src → src: ${lazy}`);
+                } catch (e) {
+                    logWarn(`#${i} patch thất bại: ${e.message}`);
+                }
             }
+
             if (img.decode) {
                 try { await img.decode(); loaded++; }
-                catch { failed++; }
+                catch { failed++; logWarn(`#${i} decode fail: ${currentSrc.slice(0, 80)}`); }
             } else if (!img.complete) {
                 await new Promise(r => {
                     img.addEventListener('load', r, { once: true });
@@ -938,33 +960,64 @@
                 loaded++;
             }
         }
-        logInfo(`forceLoad xong: ${loaded} ok, ${failed} fail, ${patched} patch data-src`);
+
+        logInfo(`forceLoad: kết thúc — ${loaded} ok, ${failed} fail, ${patched} patch data-src`);
     }
 
     function collectImages() {
         const set = new Set();
         const allowed = new Set(settings.formats.map(f => f.toLowerCase()));
-        logInfo(`Filter định dạng: ${[...allowed].join(', ')}`);
+        logInfo(`Filter định dạng: [${[...allowed].join(', ')}]`);
 
-        let skippedSmall = 0, skippedExt = 0, skippedNoSrc = 0;
+        const imgs = [...document.querySelectorAll('img')];
+        logInfo(`Tổng cộng ${imgs.length} thẻ <img> trong DOM`);
 
-        document.querySelectorAll('img').forEach(img => {
+        let skippedSmall = 0, skippedExt = 0, skippedNoSrc = 0, dup = 0;
+
+        imgs.forEach((img, i) => {
             const w = img.naturalWidth || 0;
             const h = img.naturalHeight || 0;
-            if (w < MIN_SIZE || h < MIN_SIZE) { skippedSmall++; return; }
+            const rawSrc = img.currentSrc || img.src || '(none)';
+
+            if (w < MIN_SIZE || h < MIN_SIZE) {
+                logWarn(`#${i} SKIP size ${w}x${h} (min ${MIN_SIZE}) — ${rawSrc.slice(0, 100)}`);
+                skippedSmall++;
+                return;
+            }
 
             const real = pickRealSrc(img);
-            if (!real) { skippedNoSrc++; return; }
+            if (!real) {
+                logWarn(`#${i} SKIP không có src hợp lệ — ${rawSrc.slice(0, 100)}`);
+                skippedNoSrc++;
+                return;
+            }
 
-            let ext = getExt(real);
-            if (ext === 'jpeg') ext = 'jpg';
-            if (ext && !allowed.has(ext)) { skippedExt++; return; }
-            if (!ext && !allowed.has('jpg')) { skippedExt++; return; }
+            let ext = getExt(real) || '?';
+            let extNorm = ext === 'jpeg' ? 'jpg' : ext;
+
+            if (extNorm !== '?' && !allowed.has(extNorm)) {
+                logWarn(`#${i} SKIP .${extNorm} không nằm trong filter — ${real.slice(0, 100)}`);
+                skippedExt++;
+                return;
+            }
+            if (extNorm === '?' && !allowed.has('jpg')) {
+                logWarn(`#${i} SKIP URL không có đuôi và jpg bị tắt — ${real.slice(0, 100)}`);
+                skippedExt++;
+                return;
+            }
+
+            if (set.has(real)) {
+                logInfo(`#${i} DUP bỏ qua (đã có trong set) — ${real.slice(0, 100)}`);
+                dup++;
+                return;
+            }
 
             set.add(real);
+            logSuccess(`#${i} ✓ ${w}x${h} .${extNorm} — ${real}`);
         });
 
-        logInfo(`Bỏ qua: ${skippedSmall} quá nhỏ, ${skippedExt} sai định dạng, ${skippedNoSrc} không có src`);
+        logInfo(`→ Tổng kết: nhận ${set.size} / ${imgs.length} img`);
+        logInfo(`→ Bỏ qua: ${skippedSmall} quá nhỏ, ${skippedExt} sai định dạng, ${skippedNoSrc} không src, ${dup} trùng`);
         return [...set];
     }
 
@@ -1060,10 +1113,12 @@
 
     function fetchAsBlob(url) {
         const ref = getRefererForUrl(url);
-        logInfo(`GET ${url}`);
-        logInfo(`  → Referer: ${ref}`);
+        const ext = getExt(url) || '?';
+        const t0 = performance.now();
+        logInfo(`→ GET [.${ext}] ${url}`);
+        logInfo(`  ↳ Referer: ${ref}`);
+
         return new Promise((resolve, reject) => {
-            const t0 = performance.now();
             GM_xmlhttpRequest({
                 method: 'GET',
                 url,
@@ -1076,19 +1131,20 @@
                     const dt = Math.round(performance.now() - t0);
                     if (res.status >= 200 && res.status < 300 && res.response) {
                         const size = res.response.size || 0;
-                        logSuccess(`OK ${res.status} — ${size}B (${dt}ms)`);
+                        const ct = res.responseHeaders?.match(/content-type:\s*([^\r\n;]+)/i)?.[1] || '?';
+                        logSuccess(`  ✓ ${res.status} ${ct} ${fmtSize(size)} ${dt}ms`);
                         resolve(res.response);
                     } else {
-                        logError(`FAIL HTTP ${res.status} (${dt}ms)`);
+                        logError(`  ✗ HTTP ${res.status} ${dt}ms`);
                         reject(new Error('HTTP ' + res.status));
                     }
                 },
                 onerror: (e) => {
-                    logError(`Network error: ${e?.error || 'unknown'}`);
+                    logError(`  ✗ network error: ${e?.error || 'unknown'}`);
                     reject(new Error('network'));
                 },
                 ontimeout: () => {
-                    logError('Timeout');
+                    logError('  ✗ timeout');
                     reject(new Error('timeout'));
                 },
             });
@@ -1107,59 +1163,69 @@
     }
 
     async function downloadBase(urls, onProgress) {
-        logInfo(`Bắt đầu tải ${urls.length} ảnh (mode: base, delay: ${settings.delayMs}ms)`);
-        let ok = 0, fail = 0, idx = 0;
-        for (const url of urls) {
-            idx++;
-            onProgress(`Đang tải ${idx}/${urls.length}...`);
+        logInfo(`=== Bắt đầu tải ${urls.length} ảnh (mode: base, delay: ${settings.delayMs}ms) ===`);
+        let ok = 0, fail = 0;
+        const t0 = performance.now();
+
+        for (let idx = 0; idx < urls.length; idx++) {
+            const url = urls[idx];
+            const n = idx + 1;
+            onProgress(`Đang tải ${n}/${urls.length}...`);
+            logInfo(`--- [${n}/${urls.length}] ---`);
             try {
                 const blob = await fetchAsBlob(url);
-                const name = guessFilename(url, idx);
+                const name = guessFilename(url, n);
                 triggerBlobDownload(blob, name);
-                logSuccess(`Đã lưu: ${name}`);
+                logSuccess(`Đã lưu file: ${name}`);
                 ok++;
             } catch (e) {
-                logError(`Bỏ qua: ${e.message}`);
+                logError(`Bỏ qua ảnh #${n}: ${e.message}`);
                 fail++;
             }
             await new Promise(r => setTimeout(r, settings.delayMs));
         }
-        logInfo(`Kết thúc base: ${ok} ok, ${fail} fail`);
+
+        const dt = Math.round(performance.now() - t0);
+        logInfo(`=== Kết thúc base: ${ok} ok, ${fail} fail, tổng ${dt}ms ===`);
         return { ok, fail };
     }
 
     async function downloadZip(urls, onProgress) {
-        logInfo(`Bắt đầu tải ZIP ${urls.length} ảnh (delay: ${settings.delayMs}ms)`);
+        logInfo(`=== Bắt đầu tải ZIP ${urls.length} ảnh (delay: ${settings.delayMs}ms) ===`);
         onProgress('Đang load JSZip...');
         logInfo('Đang load JSZip từ CDN...');
         const JSZip = await loadJSZip();
         logSuccess('JSZip loaded');
         const zip = new JSZip();
 
-        let ok = 0, fail = 0, idx = 0;
+        let ok = 0, fail = 0;
         const usedNames = new Set();
+        const t0 = performance.now();
 
-        for (const url of urls) {
-            idx++;
-            onProgress(`Đang tải ${idx}/${urls.length}...`);
+        for (let idx = 0; idx < urls.length; idx++) {
+            const url = urls[idx];
+            const n = idx + 1;
+            onProgress(`Đang tải ${n}/${urls.length}...`);
+            logInfo(`--- [${n}/${urls.length}] ---`);
             try {
                 const blob = await fetchAsBlob(url);
-                let name = guessFilename(url, idx);
+                let name = guessFilename(url, n);
                 if (usedNames.has(name)) {
                     const dot = name.lastIndexOf('.');
                     const base = dot > 0 ? name.slice(0, dot) : name;
                     const ext = dot > 0 ? name.slice(dot) : '';
-                    let n = 1;
-                    while (usedNames.has(`${base}_${n}${ext}`)) n++;
-                    name = `${base}_${n}${ext}`;
-                    logWarn(`Trùng tên → đổi thành: ${name}`);
+                    let k = 1;
+                    while (usedNames.has(`${base}_${k}${ext}`)) k++;
+                    const oldName = name;
+                    name = `${base}_${k}${ext}`;
+                    logWarn(`Trùng tên "${oldName}" → đổi thành "${name}"`);
                 }
                 usedNames.add(name);
                 zip.file(name, blob);
                 logSuccess(`Đã thêm vào ZIP: ${name}`);
                 ok++;
             } catch (e) {
-                logError(`Bỏ qua: ${e.message}`);
+                logError(`Bỏ qua ảnh #${n}: ${e.message}`);
                 fail++;
             }
             await new Promise(r => setTimeout(r, settings.delayMs));
@@ -1169,9 +1235,10 @@
         logInfo('Đang nén ZIP...');
         const zipBlob = await zip.generateAsync({ type: 'blob' });
         const zipName = `images_${Date.now()}.zip`;
-        logSuccess(`ZIP xong: ${zipName} (${zipBlob.size}B)`);
+        const dt = Math.round(performance.now() - t0);
+        logSuccess(`ZIP xong: ${zipName} (${fmtSize(zipBlob.size)}) trong ${dt}ms`);
         triggerBlobDownload(zipBlob, zipName);
-        logInfo(`Kết thúc ZIP: ${ok} ok, ${fail} fail`);
+        logInfo(`=== Kết thúc ZIP: ${ok} ok, ${fail} fail ===`);
         return { ok, fail };
     }
 
