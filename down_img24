@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Image Downloader MVP
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      2.6
 // @description  Quét ảnh, chọn, tải về / ZIP, settings, đa chọn, FAB đẹp, drag, log chi tiết
 // @match        *://*/*
 // @grant        GM_download
@@ -17,7 +17,7 @@
 
     // ===== Settings =====
     const DEFAULT_SETTINGS = {
-        downloadMode: 'base',       // 'base' | 'zip'
+        downloadMode: 'base',
         delayMs: 250,
         formats: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'avif', 'svg', 'bmp', 'ico'],
         extraReferers: [],
@@ -143,6 +143,7 @@
     }
 
     const MIN_SIZE = 100;
+    const DECODE_TIMEOUT = 2000;
 
     // ===== CSS =====
     const style = document.createElement('style');
@@ -924,10 +925,31 @@
         return bytes + 'B';
     }
 
+    function extFromContentType(ct) {
+        if (!ct) return '';
+        ct = ct.toLowerCase();
+        if (ct.includes('jpeg') || ct.includes('jpg')) return 'jpg';
+        if (ct.includes('png')) return 'png';
+        if (ct.includes('webp')) return 'webp';
+        if (ct.includes('gif')) return 'gif';
+        if (ct.includes('avif')) return 'avif';
+        if (ct.includes('svg')) return 'svg';
+        if (ct.includes('bmp')) return 'bmp';
+        if (ct.includes('icon') || ct.includes('ico')) return 'ico';
+        return '';
+    }
+
+    function withTimeout(promise, ms, label) {
+        return Promise.race([
+            promise,
+            new Promise((_, rej) => setTimeout(() => rej(new Error((label || 'timeout') + ' after ' + ms + 'ms')), ms)),
+        ]);
+    }
+
     async function forceLoadImages() {
         const imgs = [...document.querySelectorAll('img')];
         logInfo(`forceLoad: bắt đầu xử lý ${imgs.length} thẻ <img>`);
-        let loaded = 0, failed = 0, patched = 0;
+        let loaded = 0, failed = 0, patched = 0, timeout = 0;
 
         for (let i = 0; i < imgs.length; i++) {
             const img = imgs[i];
@@ -947,21 +969,34 @@
             }
 
             if (img.decode) {
-                try { await img.decode(); loaded++; }
-                catch { failed++; logWarn(`#${i} decode fail: ${currentSrc.slice(0, 80)}`); }
+                try {
+                    await withTimeout(img.decode(), DECODE_TIMEOUT, 'decode');
+                    loaded++;
+                } catch (e) {
+                    if (e.message && e.message.includes('decode timeout')) {
+                        timeout++;
+                        logWarn(`#${i} decode TIMEOUT (>${DECODE_TIMEOUT}ms) — ${currentSrc.slice(0, 100)}`);
+                    } else {
+                        failed++;
+                        logWarn(`#${i} decode fail: ${e.message} — ${currentSrc.slice(0, 100)}`);
+                    }
+                }
             } else if (!img.complete) {
-                await new Promise(r => {
-                    img.addEventListener('load', r, { once: true });
-                    img.addEventListener('error', r, { once: true });
-                    setTimeout(r, 1500);
-                });
+                await withTimeout(
+                    new Promise(r => {
+                        img.addEventListener('load', r, { once: true });
+                        img.addEventListener('error', r, { once: true });
+                    }),
+                    1500,
+                    'load'
+                ).catch(() => { timeout++; });
                 loaded++;
             } else {
                 loaded++;
             }
         }
 
-        logInfo(`forceLoad: kết thúc — ${loaded} ok, ${failed} fail, ${patched} patch data-src`);
+        logInfo(`forceLoad: kết thúc — ${loaded} ok, ${failed} fail, ${timeout} timeout, ${patched} patch data-src`);
     }
 
     function collectImages() {
@@ -1021,15 +1056,20 @@
         return [...set];
     }
 
-    function guessFilename(url, index) {
+    function guessFilename(url, index, contentType) {
         try {
             const u = new URL(url);
             let name = decodeURIComponent(u.pathname.split('/').pop() || '');
             name = name.split('?')[0];
-            if (!name || !/\.[a-z0-9]{2,5}$/i.test(name)) {
-                name = `image_${index}.jpg`;
-            }
-            return name;
+
+            // Nếu URL đã có đuôi → dùng luôn
+            if (name && /\.[a-z0-9]{2,5}$/i.test(name)) return name;
+
+            // Không có đuôi → đoán ext từ content-type
+            let ext = extFromContentType(contentType) || 'jpg';
+
+            if (!name) name = `image_${index}`;
+            return `${name}.${ext}`;
         } catch {
             return `image_${index}.jpg`;
         }
@@ -1131,9 +1171,9 @@
                     const dt = Math.round(performance.now() - t0);
                     if (res.status >= 200 && res.status < 300 && res.response) {
                         const size = res.response.size || 0;
-                        const ct = res.responseHeaders?.match(/content-type:\s*([^\r\n;]+)/i)?.[1] || '?';
-                        logSuccess(`  ✓ ${res.status} ${ct} ${fmtSize(size)} ${dt}ms`);
-                        resolve(res.response);
+                        const ct = res.responseHeaders?.match(/content-type:\s*([^\r\n;]+)/i)?.[1]?.trim() || '';
+                        logSuccess(`  ✓ ${res.status} ${ct || '?'} ${fmtSize(size)} ${dt}ms`);
+                        resolve({ blob: res.response, contentType: ct });
                     } else {
                         logError(`  ✗ HTTP ${res.status} ${dt}ms`);
                         reject(new Error('HTTP ' + res.status));
@@ -1173,8 +1213,8 @@
             onProgress(`Đang tải ${n}/${urls.length}...`);
             logInfo(`--- [${n}/${urls.length}] ---`);
             try {
-                const blob = await fetchAsBlob(url);
-                const name = guessFilename(url, n);
+                const { blob, contentType } = await fetchAsBlob(url);
+                const name = guessFilename(url, n, contentType);
                 triggerBlobDownload(blob, name);
                 logSuccess(`Đã lưu file: ${name}`);
                 ok++;
@@ -1208,8 +1248,8 @@
             onProgress(`Đang tải ${n}/${urls.length}...`);
             logInfo(`--- [${n}/${urls.length}] ---`);
             try {
-                const blob = await fetchAsBlob(url);
-                let name = guessFilename(url, n);
+                const { blob, contentType } = await fetchAsBlob(url);
+                let name = guessFilename(url, n, contentType);
                 if (usedNames.has(name)) {
                     const dot = name.lastIndexOf('.');
                     const base = dot > 0 ? name.slice(0, dot) : name;
