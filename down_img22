@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Image Downloader MVP
 // @namespace    http://tampermonkey.net/
-// @version      2.2
-// @description  Quét ảnh, chọn, tải về / tải ZIP, trang settings, đa chọn, FAB đẹp
+// @version      2.3
+// @description  Quét ảnh, chọn, tải về / ZIP, settings, đa chọn, FAB đẹp, drag được
 // @match        *://*/*
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
@@ -21,6 +21,8 @@
         delayMs: 250,
         formats: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'avif', 'svg', 'bmp', 'ico'],
         extraReferers: [],
+        fabPos: null,               // { x, y } viewport coords
+        panelPos: null,             // { x, y } viewport coords
     };
 
     function loadSettings() {
@@ -60,7 +62,7 @@
     // ===== CSS =====
     const style = document.createElement('style');
     style.textContent = `
-        /* ===== FAB Button ===== */
+        /* ===== FAB ===== */
         #imgdl-toggle {
             all: unset;
             position: fixed !important;
@@ -75,7 +77,7 @@
             display: flex !important;
             align-items: center !important;
             justify-content: center !important;
-            cursor: pointer !important;
+            cursor: grab !important;
             box-shadow:
                 0 4px 12px rgba(102, 126, 234, 0.4),
                 0 8px 24px rgba(102, 126, 234, 0.25) !important;
@@ -84,22 +86,30 @@
                         box-shadow .25s ease !important;
             overflow: visible !important;
             font-family: system-ui, sans-serif !important;
+            touch-action: none !important;
+            user-select: none !important;
+            -webkit-user-select: none !important;
         }
+        #imgdl-toggle:active { cursor: grabbing !important; }
         #imgdl-toggle:hover {
-            transform: scale(1.08) rotate(-4deg) !important;
             box-shadow:
                 0 6px 16px rgba(102, 126, 234, 0.55),
                 0 12px 32px rgba(102, 126, 234, 0.35) !important;
         }
-        #imgdl-toggle:active {
+        #imgdl-toggle:not(.dragging):hover {
+            transform: scale(1.08) rotate(-4deg) !important;
+        }
+        #imgdl-toggle:not(.dragging):active {
             transform: scale(.95) !important;
             transition-duration: .1s !important;
         }
         #imgdl-toggle.open {
             background: linear-gradient(135deg, #764ba2 0%, #667eea 100%) !important;
+        }
+        #imgdl-toggle.open:not(.dragging) {
             transform: rotate(90deg) !important;
         }
-        #imgdl-toggle.open:hover {
+        #imgdl-toggle.open:not(.dragging):hover {
             transform: rotate(90deg) scale(1.08) !important;
         }
         #imgdl-toggle svg {
@@ -123,7 +133,8 @@
             70%  { opacity: 0;  transform: scale(1.6); }
             100% { opacity: 0;  transform: scale(1.6); }
         }
-        #imgdl-toggle.open::before { animation: none !important; opacity: 0 !important; }
+        #imgdl-toggle.open::before,
+        #imgdl-toggle.dragging::before { animation: none !important; opacity: 0 !important; }
 
         /* Badge */
         #imgdl-badge {
@@ -176,6 +187,9 @@
             opacity: 1 !important;
             pointer-events: auto !important;
         }
+        #imgdl-panel.dragging {
+            transition: none !important;
+        }
 
         #imgdl-header {
             padding: 12px 14px !important;
@@ -183,6 +197,10 @@
             color: #fff !important;
             display: flex !important; justify-content: space-between !important;
             align-items: center !important; font-weight: 600 !important;
+            cursor: move !important;
+            user-select: none !important;
+            -webkit-user-select: none !important;
+            touch-action: none !important;
         }
         #imgdl-header button {
             all: unset; background: rgba(255,255,255,.15) !important;
@@ -192,6 +210,7 @@
             cursor: pointer !important; font-size: 11px !important;
             padding: 4px 10px !important; box-sizing: border-box !important;
             transition: background .15s ease !important;
+            touch-action: auto !important;
         }
         #imgdl-header button:hover {
             background: rgba(255,255,255,.25) !important;
@@ -394,6 +413,24 @@
             font-weight: 600 !important;
         }
 
+        /* Reset button */
+        #imgdl-reset-pos {
+            all: unset;
+            padding: 7px 14px !important;
+            border-radius: 6px !important;
+            border: 1px solid #ccc !important;
+            background: #f5f5f5 !important;
+            cursor: pointer !important;
+            font-size: 12px !important;
+            font-weight: 600 !important;
+            text-align: center !important;
+            box-sizing: border-box !important;
+            transition: background .15s ease !important;
+        }
+        #imgdl-reset-pos:hover {
+            background: #ececec !important;
+        }
+
         /* Footer */
         #imgdl-footer {
             padding: 10px 14px !important; border-top: 1px solid #eee !important;
@@ -496,6 +533,12 @@
                     </div>
                     <div class="imgdl-hint">Referer mặc định là origin trang hiện tại. Thêm vào để thử các domain khác nếu bị 403.</div>
                 </div>
+
+                <div class="imgdl-field">
+                    <label>Vị trí</label>
+                    <button id="imgdl-reset-pos">Reset về mặc định</button>
+                    <div class="imgdl-hint">Đưa nút và panel về góc dưới phải.</div>
+                </div>
             </div>
         </div>
 
@@ -513,6 +556,136 @@
 
     const selected = new Set();
     let allImages = [];
+
+    // ===== Apply saved positions =====
+    function applySavedPos(el, pos) {
+        if (!pos) return;
+        const w = el.offsetWidth || 56;
+        const h = el.offsetHeight || 56;
+        const x = Math.max(0, Math.min(window.innerWidth - w, pos.x));
+        const y = Math.max(0, Math.min(window.innerHeight - h, pos.y));
+        el.style.setProperty('left', x + 'px', 'important');
+        el.style.setProperty('top', y + 'px', 'important');
+        el.style.setProperty('right', 'auto', 'important');
+        el.style.setProperty('bottom', 'auto', 'important');
+    }
+
+    // Apply vị trí FAB sau khi DOM có kích thước
+    requestAnimationFrame(() => {
+        applySavedPos(toggleBtn, settings.fabPos);
+    });
+
+    // ===== Drag helper =====
+    function makeDraggable(el, handleEl, storageKey, { onDragStart, onDragEnd } = {}) {
+        let dragging = false;
+        let startX = 0, startY = 0;
+        let startLeft = 0, startTop = 0;
+        let moved = false;
+        let pointerId = null;
+
+        function onPointerDown(e) {
+            if (e.button !== undefined && e.button !== 0) return;
+
+            // Bỏ qua khi bấm vào button/input bên trong handle
+            const t = e.target;
+            if (t && t.closest && t.closest('button, input, a, textarea, select')) return;
+
+            dragging = true;
+            moved = false;
+            pointerId = e.pointerId;
+            startX = e.clientX;
+            startY = e.clientY;
+
+            const rect = el.getBoundingClientRect();
+            startLeft = rect.left;
+            startTop = rect.top;
+
+            el.style.setProperty('left', rect.left + 'px', 'important');
+            el.style.setProperty('top', rect.top + 'px', 'important');
+            el.style.setProperty('right', 'auto', 'important');
+            el.style.setProperty('bottom', 'auto', 'important');
+
+            el.classList.add('dragging');
+
+            try { handleEl.setPointerCapture(e.pointerId); } catch {}
+
+            document.addEventListener('pointermove', onPointerMove, true);
+            document.addEventListener('pointerup', onPointerUp, true);
+            document.addEventListener('pointercancel', onPointerUp, true);
+
+            onDragStart?.();
+        }
+
+        function onPointerMove(e) {
+            if (!dragging) return;
+            if (pointerId !== null && e.pointerId !== pointerId) return;
+
+            const dx = e.clientX - startX;
+            const dy = e.clientY - startY;
+
+            if (!moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) moved = true;
+            if (!moved) return;
+
+            const w = el.offsetWidth;
+            const h = el.offsetHeight;
+            let newLeft = startLeft + dx;
+            let newTop = startTop + dy;
+
+            newLeft = Math.max(0, Math.min(window.innerWidth - w, newLeft));
+            newTop = Math.max(0, Math.min(window.innerHeight - h, newTop));
+
+            el.style.setProperty('left', newLeft + 'px', 'important');
+            el.style.setProperty('top', newTop + 'px', 'important');
+
+            e.preventDefault();
+        }
+
+        function onPointerUp(e) {
+            if (!dragging) return;
+            if (pointerId !== null && e.pointerId !== pointerId) return;
+
+            dragging = false;
+            pointerId = null;
+            document.removeEventListener('pointermove', onPointerMove, true);
+            document.removeEventListener('pointerup', onPointerUp, true);
+            document.removeEventListener('pointercancel', onPointerUp, true);
+
+            try { handleEl.releasePointerCapture(e.pointerId); } catch {}
+
+            el.classList.remove('dragging');
+
+            if (moved) {
+                const rect = el.getBoundingClientRect();
+                settings[storageKey] = { x: rect.left, y: rect.top };
+                saveSettings(settings);
+            }
+
+            onDragEnd?.(moved);
+        }
+
+        handleEl.addEventListener('pointerdown', onPointerDown);
+    }
+
+    // Wire FAB
+    makeDraggable(toggleBtn, toggleBtn, 'fabPos', {
+        onDragStart: () => {
+            toggleBtn.style.setProperty('transition', 'none', 'important');
+        },
+        onDragEnd: (moved) => {
+            toggleBtn.style.removeProperty('transition');
+            if (moved) {
+                toggleBtn.dataset.justDragged = '1';
+                setTimeout(() => delete toggleBtn.dataset.justDragged, 80);
+            }
+        }
+    });
+
+    // Wire Panel (qua header)
+    const panelHeader = panel.querySelector('#imgdl-header');
+    makeDraggable(panel, panelHeader, 'panelPos', {
+        onDragStart: () => {},
+        onDragEnd: () => {}
+    });
 
     // ===== Helpers =====
     function pickRealSrc(img) {
@@ -856,11 +1029,17 @@
 
     // ===== Events =====
     toggleBtn.addEventListener('click', (e) => {
+        if (toggleBtn.dataset.justDragged) return;
         e.preventDefault();
         e.stopPropagation();
         const isOpen = panel.classList.toggle('open');
         toggleBtn.classList.toggle('open', isOpen);
-        if (isOpen && allImages.length === 0) scan();
+        if (isOpen) {
+            requestAnimationFrame(() => {
+                applySavedPos(panel, settings.panelPos);
+            });
+            if (allImages.length === 0) scan();
+        }
     }, true);
 
     // Tabs
@@ -909,6 +1088,25 @@
     }
     refAddBtn.addEventListener('click', addReferer);
     refInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') addReferer(); });
+
+    // Reset position
+    panel.querySelector('#imgdl-reset-pos').addEventListener('click', () => {
+        settings.fabPos = null;
+        settings.panelPos = null;
+        saveSettings(settings);
+
+        // Reset FAB
+        toggleBtn.style.removeProperty('left');
+        toggleBtn.style.removeProperty('top');
+        toggleBtn.style.setProperty('right', '24px', 'important');
+        toggleBtn.style.setProperty('bottom', '24px', 'important');
+
+        // Reset panel
+        panel.style.removeProperty('left');
+        panel.style.removeProperty('top');
+        panel.style.setProperty('right', '24px', 'important');
+        panel.style.setProperty('bottom', '92px', 'important');
+    });
 
     // ===== Multi-select menu =====
     const multiBtn = panel.querySelector('#imgdl-multi');
@@ -971,6 +1169,28 @@
         setProgress('');
         render();
     }
+
+    // ===== Window resize handler =====
+    window.addEventListener('resize', () => {
+        if (settings.fabPos) {
+            const rect = toggleBtn.getBoundingClientRect();
+            const x = Math.max(0, Math.min(window.innerWidth - rect.width, rect.left));
+            const y = Math.max(0, Math.min(window.innerHeight - rect.height, rect.top));
+            toggleBtn.style.setProperty('left', x + 'px', 'important');
+            toggleBtn.style.setProperty('top', y + 'px', 'important');
+            settings.fabPos = { x, y };
+            saveSettings(settings);
+        }
+        if (settings.panelPos && panel.classList.contains('open')) {
+            const rect = panel.getBoundingClientRect();
+            const x = Math.max(0, Math.min(window.innerWidth - rect.width, rect.left));
+            const y = Math.max(0, Math.min(window.innerHeight - rect.height, rect.top));
+            panel.style.setProperty('left', x + 'px', 'important');
+            panel.style.setProperty('top', y + 'px', 'important');
+            settings.panelPos = { x, y };
+            saveSettings(settings);
+        }
+    });
 
     // ===== Init =====
     renderSettingsUI();
