@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         Image Downloader MVP
 // @namespace    http://tampermonkey.net/
-// @version      1.4
-// @description  Quét ảnh trên trang, chọn/bỏ chọn, tải về (bypass hotlink)
+// @version      2.0
+// @description  Quét ảnh, chọn, tải về / tải ZIP, có trang settings
 // @match        *://*/*
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @connect      *
 // @run-at       document-idle
 // ==/UserScript==
@@ -13,9 +15,49 @@
 (function () {
     'use strict';
 
+    // ===== Settings mặc định =====
+    const DEFAULT_SETTINGS = {
+        downloadMode: 'base',       // 'base' | 'zip'
+        delayMs: 250,               // delay giữa các ảnh
+        formats: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'avif', 'svg', 'bmp', 'ico'],
+        extraReferers: [],          // mảng domain referer tuỳ chỉnh
+    };
+
+    function loadSettings() {
+        try {
+            const raw = GM_getValue('imgdl_settings', null);
+            if (!raw) return { ...DEFAULT_SETTINGS };
+            const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            return { ...DEFAULT_SETTINGS, ...parsed };
+        } catch {
+            return { ...DEFAULT_SETTINGS };
+        }
+    }
+    function saveSettings(s) {
+        GM_setValue('imgdl_settings', JSON.stringify(s));
+    }
+
+    let settings = loadSettings();
+
+    // ===== Load JSZip lazily (chỉ khi cần) =====
+    const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+    let jszipPromise = null;
+    function loadJSZip() {
+        if (jszipPromise) return jszipPromise;
+        jszipPromise = new Promise((resolve, reject) => {
+            if (window.JSZip) return resolve(window.JSZip);
+            const s = document.createElement('script');
+            s.src = JSZIP_URL;
+            s.onload = () => resolve(window.JSZip);
+            s.onerror = () => reject(new Error('Không load được JSZip'));
+            document.head.appendChild(s);
+        });
+        return jszipPromise;
+    }
+
     const MIN_SIZE = 100;
 
-    // ===== CSS (giữ nguyên) =====
+    // ===== CSS =====
     const style = document.createElement('style');
     style.textContent = `
         #imgdl-toggle {
@@ -30,12 +72,12 @@
         #imgdl-panel {
             all: unset;
             position: fixed !important; bottom: 80px !important; right: 20px !important;
-            z-index: 2147483647 !important; width: 360px !important; max-height: 72vh !important;
+            z-index: 2147483647 !important; width: 400px !important; max-height: 76vh !important;
             background: #fff !important; color: #222 !important; border-radius: 10px !important;
             box-shadow: 0 8px 24px rgba(0,0,0,.25) !important;
             font-family: system-ui, -apple-system, sans-serif !important;
             font-size: 13px !important; display: none !important; flex-direction: column !important;
-            overflow: hidden !important; box-sizing: border-box !important; line-height: 1.3 !important;
+            overflow: hidden !important; box-sizing: border-box !important; line-height: 1.4 !important;
         }
         #imgdl-panel.open { display: flex !important; }
         #imgdl-header {
@@ -49,6 +91,25 @@
             cursor: pointer !important; font-size: 11px !important;
             padding: 3px 8px !important; box-sizing: border-box !important;
         }
+        /* Tabs */
+        #imgdl-tabs {
+            display: flex !important; border-bottom: 1px solid #eee !important;
+            background: #fafafa !important;
+        }
+        .imgdl-tab {
+            all: unset; flex: 1 !important; text-align: center !important;
+            padding: 8px !important; cursor: pointer !important;
+            font-weight: 600 !important; color: #666 !important;
+            border-bottom: 2px solid transparent !important;
+            box-sizing: border-box !important;
+        }
+        .imgdl-tab.active {
+            color: #222 !important; border-bottom-color: #222 !important;
+        }
+        .imgdl-page { display: none !important; flex-direction: column !important; flex: 1 1 auto !important; overflow: hidden !important; }
+        .imgdl-page.active { display: flex !important; }
+
+        /* Images tab */
         #imgdl-list {
             flex: 1 1 auto !important; overflow-y: auto !important; padding: 8px !important;
             display: grid !important; grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
@@ -73,27 +134,129 @@
             font-size: 16px !important; text-shadow: 0 0 3px #fff, 0 0 3px #fff !important;
             pointer-events: none !important;
         }
+        #imgdl-empty {
+            grid-column: 1 / -1 !important; padding: 20px !important;
+            text-align: center !important; color: #888 !important;
+        }
+
+        /* Settings tab */
+        #imgdl-settings {
+            padding: 12px !important; overflow-y: auto !important;
+            display: flex !important; flex-direction: column !important; gap: 14px !important;
+        }
+        .imgdl-field { display: flex !important; flex-direction: column !important; gap: 6px !important; }
+        .imgdl-field > label {
+            font-weight: 600 !important; color: #333 !important; font-size: 12px !important;
+        }
+        .imgdl-hint { font-size: 11px !important; color: #888 !important; }
+
+        /* Toggle */
+        .imgdl-toggle-group {
+            display: flex !important; background: #f0f0f0 !important;
+            border-radius: 8px !important; padding: 3px !important; gap: 3px !important;
+        }
+        .imgdl-toggle-group button {
+            all: unset; flex: 1 !important; text-align: center !important;
+            padding: 7px !important; cursor: pointer !important;
+            border-radius: 6px !important; font-size: 12px !important;
+            font-weight: 600 !important; color: #555 !important;
+            box-sizing: border-box !important;
+        }
+        .imgdl-toggle-group button.active {
+            background: #fff !important; color: #222 !important;
+            box-shadow: 0 1px 3px rgba(0,0,0,.1) !important;
+        }
+
+        /* Slider */
+        .imgdl-slider-row {
+            display: flex !important; align-items: center !important; gap: 8px !important;
+        }
+        .imgdl-slider-row input[type="range"] {
+            all: unset; flex: 1 !important; height: 4px !important;
+            background: #ddd !important; border-radius: 2px !important;
+            cursor: pointer !important; position: relative !important;
+        }
+        .imgdl-slider-row input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none !important; appearance: none !important;
+            width: 16px !important; height: 16px !important; border-radius: 50% !important;
+            background: #222 !important; cursor: pointer !important; margin-top: -6px !important;
+        }
+        .imgdl-slider-row input[type="range"]::-moz-range-thumb {
+            width: 16px !important; height: 16px !important; border-radius: 50% !important;
+            background: #222 !important; cursor: pointer !important; border: none !important;
+        }
+        .imgdl-slider-val {
+            min-width: 60px !important; text-align: right !important;
+            font-variant-numeric: tabular-nums !important; font-weight: 600 !important;
+            font-size: 12px !important;
+        }
+
+        /* Checkbox grid cho formats */
+        .imgdl-formats {
+            display: grid !important; grid-template-columns: repeat(3, 1fr) !important;
+            gap: 6px !important;
+        }
+        .imgdl-fmt {
+            display: flex !important; align-items: center !important; gap: 6px !important;
+            padding: 6px 8px !important; background: #f5f5f5 !important;
+            border-radius: 6px !important; cursor: pointer !important;
+            font-size: 12px !important; user-select: none !important;
+        }
+        .imgdl-fmt input { margin: 0 !important; cursor: pointer !important; }
+        .imgdl-fmt.on { background: #e8f8ef !important; }
+
+        /* Referer list */
+        .imgdl-referer-list {
+            display: flex !important; flex-direction: column !important; gap: 4px !important;
+            max-height: 140px !important; overflow-y: auto !important;
+        }
+        .imgdl-referer-row {
+            display: flex !important; align-items: center !important; gap: 6px !important;
+            padding: 6px 8px !important; background: #f5f5f5 !important;
+            border-radius: 6px !important; font-size: 12px !important;
+        }
+        .imgdl-referer-row span {
+            flex: 1 !important; word-break: break-all !important;
+            font-family: monospace !important;
+        }
+        .imgdl-referer-row button {
+            all: unset; cursor: pointer !important; color: #e74c3c !important;
+            font-weight: bold !important; padding: 0 4px !important;
+        }
+        .imgdl-add-row {
+            display: flex !important; gap: 6px !important;
+        }
+        .imgdl-add-row input {
+            all: unset; flex: 1 !important; padding: 6px 8px !important;
+            border: 1px solid #ccc !important; border-radius: 6px !important;
+            font-size: 12px !important; box-sizing: border-box !important;
+            font-family: monospace !important;
+        }
+        .imgdl-add-row button {
+            all: unset; padding: 6px 12px !important; background: #222 !important;
+            color: #fff !important; border-radius: 6px !important;
+            cursor: pointer !important; font-size: 12px !important;
+            font-weight: 600 !important;
+        }
+
+        /* Footer */
         #imgdl-footer {
             padding: 10px 12px !important; border-top: 1px solid #eee !important;
             display: flex !important; gap: 8px !important; align-items: center !important;
             justify-content: space-between !important; box-sizing: border-box !important;
         }
-        #imgdl-footer button {
-            all: unset; padding: 6px 12px !important; border-radius: 6px !important;
-            border: 1px solid #ccc !important; background: #f5f5f5 !important;
-            color: #222 !important; cursor: pointer !important; font-size: 13px !important;
-            box-sizing: border-box !important;
+        #imgdl-footer .imgdl-meta {
+            display: flex !important; flex-direction: column !important;
+            font-size: 11px !important; color: #555 !important;
         }
-        #imgdl-download {
+        #imgdl-footer button#imgdl-download {
+            all: unset; padding: 7px 14px !important; border-radius: 6px !important;
             background: #2ecc71 !important; color: #fff !important;
-            border-color: #2ecc71 !important;
+            cursor: pointer !important; font-size: 13px !important;
+            font-weight: 600 !important; box-sizing: border-box !important;
         }
         #imgdl-download:disabled { opacity: .5 !important; cursor: not-allowed !important; }
-        #imgdl-empty {
-            grid-column: 1 / -1 !important; padding: 20px !important;
-            text-align: center !important; color: #888 !important;
-        }
-        #imgdl-progress { font-size: 12px !important; color: #555 !important; }
+        #imgdl-progress { color: #888 !important; }
     `;
     document.head.appendChild(style);
 
@@ -106,13 +269,60 @@
     panel.id = 'imgdl-panel';
     panel.innerHTML = `
         <div id="imgdl-header">
-            <span>Ảnh (<span id="imgdl-count">0</span>)</span>
+            <span>Image Downloader</span>
             <button id="imgdl-rescan">Quét lại</button>
         </div>
-        <div id="imgdl-list"></div>
+        <div id="imgdl-tabs">
+            <button class="imgdl-tab active" data-tab="images">Ảnh (<span id="imgdl-count">0</span>)</button>
+            <button class="imgdl-tab" data-tab="settings">Cài đặt</button>
+        </div>
+
+        <div class="imgdl-page active" data-page="images">
+            <div id="imgdl-list"></div>
+        </div>
+
+        <div class="imgdl-page" data-page="settings">
+            <div id="imgdl-settings">
+                <div class="imgdl-field">
+                    <label>Chế độ tải</label>
+                    <div class="imgdl-toggle-group" id="imgdl-mode">
+                        <button data-mode="base">Tải từng ảnh</button>
+                        <button data-mode="zip">Đóng ZIP</button>
+                    </div>
+                </div>
+
+                <div class="imgdl-field">
+                    <label>Tốc độ tải (delay giữa các ảnh)</label>
+                    <div class="imgdl-slider-row">
+                        <input type="range" id="imgdl-delay" min="0" max="2000" step="50" value="250">
+                        <span class="imgdl-slider-val" id="imgdl-delay-val">250ms</span>
+                    </div>
+                    <div class="imgdl-hint">Càng nhỏ càng nhanh, nhưng dễ bị server chặn.</div>
+                </div>
+
+                <div class="imgdl-field">
+                    <label>Định dạng ưu tiên</label>
+                    <div class="imgdl-formats" id="imgdl-formats"></div>
+                    <div class="imgdl-hint">Chỉ quét các định dạng được chọn.</div>
+                </div>
+
+                <div class="imgdl-field">
+                    <label>Referer tùy chỉnh</label>
+                    <div class="imgdl-referer-list" id="imgdl-referer-list"></div>
+                    <div class="imgdl-add-row">
+                        <input type="text" id="imgdl-referer-input" placeholder="https://example.com/">
+                        <button id="imgdl-referer-add">Thêm</button>
+                    </div>
+                    <div class="imgdl-hint">Referer mặc định là origin trang hiện tại. Thêm vào để thử các domain khác nếu bị 403.</div>
+                </div>
+            </div>
+        </div>
+
         <div id="imgdl-footer">
-            <span id="imgdl-selected-count">Đã chọn: 0</span>
-            <span id="imgdl-progress"></span>
+            <div class="imgdl-meta">
+                <span id="imgdl-selected-count">Đã chọn: 0</span>
+                <span id="imgdl-progress"></span>
+            </div>
             <button id="imgdl-download">Tải về</button>
         </div>
     `;
@@ -140,6 +350,14 @@
         return null;
     }
 
+    function getExt(url) {
+        try {
+            const path = new URL(url).pathname;
+            const m = path.match(/\.([a-z0-9]{2,5})$/i);
+            return m ? m[1].toLowerCase() : '';
+        } catch { return ''; }
+    }
+
     async function forceLoadImages() {
         const imgs = [...document.querySelectorAll('img')];
         for (const img of imgs) {
@@ -163,12 +381,24 @@
 
     function collectImages() {
         const set = new Set();
+        const allowed = new Set(settings.formats.map(f => f.toLowerCase()));
+
         document.querySelectorAll('img').forEach(img => {
             const w = img.naturalWidth || 0;
             const h = img.naturalHeight || 0;
             if (w < MIN_SIZE || h < MIN_SIZE) return;
+
             const real = pickRealSrc(img);
-            if (real) set.add(real);
+            if (!real) return;
+
+            // Filter theo định dạng
+            let ext = getExt(real);
+            if (ext === 'jpeg') ext = 'jpg';
+            if (ext && !allowed.has(ext)) return;
+            // Nếu URL không có đuôi → coi như jpg (fallback chung)
+            if (!ext && !allowed.has('jpg')) return;
+
+            set.add(real);
         });
         return [...set];
     }
@@ -237,7 +467,24 @@
         panel.querySelector('#imgdl-progress').textContent = text;
     }
 
-    // ===== Tải qua GM_xmlhttpRequest với Referer =====
+    // ===== Referer resolution =====
+    function getRefererForUrl(url) {
+        // 1. Nếu user có list, thử match theo domain ảnh
+        try {
+            const imgHost = new URL(url).hostname;
+            for (const r of settings.extraReferers) {
+                try {
+                    const rHost = new URL(r).hostname;
+                    if (imgHost === rHost || imgHost.endsWith('.' + rHost) || rHost.endsWith('.' + imgHost)) {
+                        return r;
+                    }
+                } catch {}
+            }
+        } catch {}
+        // 2. Mặc định: origin của trang hiện tại
+        return location.origin + '/';
+    }
+
     function fetchAsBlob(url) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
@@ -245,8 +492,7 @@
                 url,
                 responseType: 'blob',
                 headers: {
-                    // Referer = origin của trang hiện tại → bypass hotlink check
-                    'Referer': location.origin + '/',
+                    'Referer': getRefererForUrl(url),
                     'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
                 },
                 onload: (res) => {
@@ -256,10 +502,66 @@
                         reject(new Error('HTTP ' + res.status));
                     }
                 },
-                onerror: reject,
+                onerror: () => reject(new Error('network')),
                 ontimeout: () => reject(new Error('timeout')),
             });
         });
+    }
+
+    // ===== Download =====
+    function triggerBlobDownload(blob, filename) {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+    }
+
+    async function downloadBase(urls, onProgress) {
+        let ok = 0, fail = 0, idx = 0;
+        for (const url of urls) {
+            idx++;
+            onProgress(`Đang tải ${idx}/${urls.length}...`);
+            try {
+                const blob = await fetchAsBlob(url);
+                triggerBlobDownload(blob, guessFilename(url, idx));
+                ok++;
+            } catch (e) {
+                console.warn('[imgdl] Fail:', url, e);
+                fail++;
+            }
+            await new Promise(r => setTimeout(r, settings.delayMs));
+        }
+        return { ok, fail };
+    }
+
+    async function downloadZip(urls, onProgress) {
+        onProgress('Đang load JSZip...');
+        const JSZip = await loadJSZip();
+        const zip = new JSZip();
+
+        let ok = 0, fail = 0, idx = 0;
+        for (const url of urls) {
+            idx++;
+            onProgress(`Đang tải ${idx}/${urls.length}...`);
+            try {
+                const blob = await fetchAsBlob(url);
+                const name = guessFilename(url, idx);
+                zip.file(name, blob);
+                ok++;
+            } catch (e) {
+                console.warn('[imgdl] Fail:', url, e);
+                fail++;
+            }
+            await new Promise(r => setTimeout(r, settings.delayMs));
+        }
+
+        onProgress('Đang nén ZIP...');
+        const zipBlob = await zip.generateAsync({ type: 'blob' });
+        triggerBlobDownload(zipBlob, `images_${Date.now()}.zip`);
+        return { ok, fail };
     }
 
     async function downloadSelected() {
@@ -270,41 +572,96 @@
         const btn = panel.querySelector('#imgdl-download');
         btn.disabled = true;
 
-        const urls = [...selected];
-        let idx = 0, ok = 0, fail = 0;
-        for (const url of urls) {
-            idx++;
-            const filename = guessFilename(url, idx);
-            setProgress(`${idx}/${urls.length}...`);
-            try {
-                const blob = await fetchAsBlob(url);
-
-                // Nếu server trả ảnh lỗi 4.44KB thì vẫn tải — nhưng log để biết
-                if (blob.size < 3000) {
-                    console.warn('[imgdl] Nghi ngờ ảnh lỗi/placeholder:', blob.size, url);
-                }
-
-                const a = document.createElement('a');
-                a.href = URL.createObjectURL(blob);
-                a.download = filename;
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-                setTimeout(() => URL.revokeObjectURL(a.href), 3000);
-                ok++;
-            } catch (e) {
-                console.warn('[imgdl] Fail:', url, e);
-                fail++;
+        try {
+            const urls = [...selected];
+            let result;
+            if (settings.downloadMode === 'zip') {
+                result = await downloadZip(urls, setProgress);
+            } else {
+                result = await downloadBase(urls, setProgress);
             }
-            await new Promise(r => setTimeout(r, 250));
+            setProgress(`Xong: ${result.ok} ok, ${result.fail} lỗi`);
+        } catch (e) {
+            console.error(e);
+            setProgress('Lỗi: ' + e.message);
+        } finally {
+            btn.disabled = false;
+            setTimeout(() => setProgress(''), 4000);
         }
+    }
 
-        setProgress(`Xong: ${ok} ok, ${fail} lỗi`);
-        btn.disabled = false;
-        setTimeout(() => setProgress(''), 3000);
+    // ===== Settings UI =====
+    const ALL_FORMATS = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'avif', 'svg', 'bmp', 'ico'];
+
+    function renderSettingsUI() {
+        // Mode toggle
+        panel.querySelectorAll('#imgdl-mode button').forEach(b => {
+            b.classList.toggle('active', b.dataset.mode === settings.downloadMode);
+        });
+
+        // Delay slider
+        const delayEl = panel.querySelector('#imgdl-delay');
+        delayEl.value = settings.delayMs;
+        panel.querySelector('#imgdl-delay-val').textContent = settings.delayMs + 'ms';
+
+        // Formats
+        const fmtWrap = panel.querySelector('#imgdl-formats');
+        fmtWrap.innerHTML = '';
+        ALL_FORMATS.forEach(f => {
+            const label = document.createElement('label');
+            label.className = 'imgdl-fmt' + (settings.formats.includes(f) ? ' on' : '');
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = settings.formats.includes(f);
+            cb.addEventListener('change', () => {
+                if (cb.checked) {
+                    if (!settings.formats.includes(f)) settings.formats.push(f);
+                } else {
+                    settings.formats = settings.formats.filter(x => x !== f);
+                }
+                label.classList.toggle('on', cb.checked);
+                saveSettings(settings);
+            });
+            label.appendChild(cb);
+            label.appendChild(document.createTextNode('.' + f));
+            fmtWrap.appendChild(label);
+        });
+
+        // Referer list
+        renderRefererList();
+    }
+
+    function renderRefererList() {
+        const wrap = panel.querySelector('#imgdl-referer-list');
+        wrap.innerHTML = '';
+        if (settings.extraReferers.length === 0) {
+            const hint = document.createElement('div');
+            hint.className = 'imgdl-hint';
+            hint.textContent = 'Chưa có referer tùy chỉnh.';
+            wrap.appendChild(hint);
+            return;
+        }
+        settings.extraReferers.forEach((r, i) => {
+            const row = document.createElement('div');
+            row.className = 'imgdl-referer-row';
+            const span = document.createElement('span');
+            span.textContent = r;
+            const btn = document.createElement('button');
+            btn.textContent = '✕';
+            btn.title = 'Xoá';
+            btn.addEventListener('click', () => {
+                settings.extraReferers.splice(i, 1);
+                saveSettings(settings);
+                renderRefererList();
+            });
+            row.appendChild(span);
+            row.appendChild(btn);
+            wrap.appendChild(row);
+        });
     }
 
     // ===== Events =====
+    // Toggle panel
     toggleBtn.addEventListener('click', (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -312,7 +669,56 @@
         if (panel.classList.contains('open') && allImages.length === 0) scan();
     }, true);
 
+    // Tabs
+    panel.querySelectorAll('.imgdl-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            const name = tab.dataset.tab;
+            panel.querySelectorAll('.imgdl-tab').forEach(t => t.classList.toggle('active', t === tab));
+            panel.querySelectorAll('.imgdl-page').forEach(p => {
+                p.classList.toggle('active', p.dataset.page === name);
+            });
+        });
+    });
+
+    // Mode toggle
+    panel.querySelectorAll('#imgdl-mode button').forEach(b => {
+        b.addEventListener('click', () => {
+            settings.downloadMode = b.dataset.mode;
+            saveSettings(settings);
+            renderSettingsUI();
+        });
+    });
+
+    // Delay slider
+    const delayEl = panel.querySelector('#imgdl-delay');
+    delayEl.addEventListener('input', () => {
+        settings.delayMs = parseInt(delayEl.value, 10);
+        panel.querySelector('#imgdl-delay-val').textContent = settings.delayMs + 'ms';
+        saveSettings(settings);
+    });
+
+    // Referer add
+    const refInput = panel.querySelector('#imgdl-referer-input');
+    const refAddBtn = panel.querySelector('#imgdl-referer-add');
+    function addReferer() {
+        let v = refInput.value.trim();
+        if (!v) return;
+        if (!/^https?:\/\//i.test(v)) v = 'https://' + v;
+        if (!v.endsWith('/')) v += '/';
+        try { new URL(v); } catch { alert('URL không hợp lệ'); return; }
+        if (!settings.extraReferers.includes(v)) {
+            settings.extraReferers.push(v);
+            saveSettings(settings);
+            renderRefererList();
+        }
+        refInput.value = '';
+    }
+    refAddBtn.addEventListener('click', addReferer);
+    refInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') addReferer(); });
+
+    // Rescan
     panel.querySelector('#imgdl-rescan').addEventListener('click', scan);
+    // Download
     panel.querySelector('#imgdl-download').addEventListener('click', downloadSelected);
 
     async function scan() {
@@ -324,4 +730,7 @@
         setProgress('');
         render();
     }
+
+    // ===== Init =====
+    renderSettingsUI();
 })();
