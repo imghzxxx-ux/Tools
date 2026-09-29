@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Image Downloader MVP
 // @namespace    http://tampermonkey.net/
-// @version      1.1
-// @description  Quét ảnh, chọn, đổi tên, tải ZIP
+// @version      1.2
+// @description  Quét ảnh, chọn, đổi tên, tải ZIP hoặc từng file
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_download
@@ -179,6 +179,40 @@
             font-size: 12px !important;
             color: #555 !important;
         }
+        #imgdl-footer label {
+            display: inline-flex !important;
+            align-items: center !important;
+            gap: 4px !important;
+            cursor: pointer !important;
+            color: #555 !important;
+            font-size: 12px !important;
+            user-select: none !important;
+        }
+        #imgdl-footer input[type="checkbox"] {
+            all: unset;
+            width: 14px !important;
+            height: 14px !important;
+            border: 1px solid #999 !important;
+            border-radius: 3px !important;
+            background: #fff !important;
+            cursor: pointer !important;
+            box-sizing: border-box !important;
+            position: relative !important;
+            flex: 0 0 auto !important;
+        }
+        #imgdl-footer input[type="checkbox"]:checked {
+            background: #2ecc71 !important;
+            border-color: #2ecc71 !important;
+        }
+        #imgdl-footer input[type="checkbox"]:checked::after {
+            content: "✓" !important;
+            position: absolute !important;
+            top: -3px !important;
+            left: 1px !important;
+            color: #fff !important;
+            font-size: 12px !important;
+            font-weight: bold !important;
+        }
     `;
     document.head.appendChild(style);
 
@@ -197,8 +231,12 @@
         <div id="imgdl-list"></div>
         <div id="imgdl-footer">
             <span id="imgdl-selected-count">Đã chọn: 0</span>
+            <label>
+                <input type="checkbox" id="imgdl-zip-toggle" checked>
+                Nén ZIP
+            </label>
             <span id="imgdl-progress"></span>
-            <button id="imgdl-download">Tải ZIP</button>
+            <button id="imgdl-download">Tải về</button>
         </div>
     `;
 
@@ -219,7 +257,6 @@
             if (src && !src.startsWith('data:') && src.startsWith('http')) {
                 set.add(src);
             }
-            // ưu tiên data-src nếu có (lazy-load)
             ['data-src', 'data-original', 'data-lazy-src'].forEach(attr => {
                 const v = img.getAttribute(attr);
                 if (v && v.startsWith('http')) set.add(v);
@@ -278,7 +315,6 @@
 
             item.appendChild(img);
 
-            // dùng mousedown + preventDefault để chắc ăn ăn được event
             item.addEventListener('click', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -303,10 +339,8 @@
         panel.querySelector('#imgdl-progress').textContent = text;
     }
 
-    // fetch ảnh thành blob, trả về {blob, contentType}
     function fetchAsBlob(url) {
         return new Promise((resolve, reject) => {
-            // dùng GM_xmlhttpRequest để tránh CORS / referer bị chặn
             if (typeof GM_xmlhttpRequest === 'function') {
                 GM_xmlhttpRequest({
                     method: 'GET',
@@ -335,44 +369,70 @@
         });
     }
 
-    async function downloadZip() {
+    function triggerDownload(blob, filename) {
+        const a = document.createElement('a');
+        const href = URL.createObjectURL(blob);
+        a.href = href;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(href), 5000);
+    }
+
+    // ===== Download =====
+    async function downloadAll() {
         if (selected.size === 0) {
             alert('Chưa chọn ảnh nào');
             return;
         }
+        const useZip = panel.querySelector('#imgdl-zip-toggle').checked;
         const btn = panel.querySelector('#imgdl-download');
         btn.disabled = true;
 
         try {
-            const JSZip = await loadJSZip();
-            const zip = new JSZip();
             const urls = [...selected];
-
             let ok = 0, fail = 0, idx = 0;
-            for (const url of urls) {
-                idx++;
-                setProgress(`Đang tải ${idx}/${urls.length}...`);
-                try {
-                    const { blob, contentType } = await fetchAsBlob(url);
-                    const ext = extFromContentType(contentType) || getExt(url);
-                    zip.file(`${idx}.${ext}`, blob);
-                    ok++;
-                } catch (e) {
-                    console.warn('Fail:', url, e);
-                    fail++;
+
+            if (useZip) {
+                // ---- Nhánh ZIP ----
+                const JSZip = await loadJSZip();
+                const zip = new JSZip();
+
+                for (const url of urls) {
+                    idx++;
+                    setProgress(`Đang tải ${idx}/${urls.length}...`);
+                    try {
+                        const { blob, contentType } = await fetchAsBlob(url);
+                        const ext = extFromContentType(contentType) || getExt(url);
+                        zip.file(`${idx}.${ext}`, blob);
+                        ok++;
+                    } catch (e) {
+                        console.warn('Fail:', url, e);
+                        fail++;
+                    }
+                }
+
+                setProgress('Đang nén ZIP...');
+                const zipBlob = await zip.generateAsync({ type: 'blob' });
+                triggerDownload(zipBlob, `images_${Date.now()}.zip`);
+            } else {
+                // ---- Nhánh tải từng file ----
+                for (const url of urls) {
+                    idx++;
+                    setProgress(`Đang tải ${idx}/${urls.length}...`);
+                    try {
+                        const { blob, contentType } = await fetchAsBlob(url);
+                        const ext = extFromContentType(contentType) || getExt(url);
+                        triggerDownload(blob, `${idx}.${ext}`);
+                        ok++;
+                    } catch (e) {
+                        console.warn('Fail:', url, e);
+                        fail++;
+                    }
+                    await new Promise(r => setTimeout(r, 250));
                 }
             }
-
-            setProgress('Đang nén ZIP...');
-            const zipBlob = await zip.generateAsync({ type: 'blob' });
-            const a = document.createElement('a');
-            const href = URL.createObjectURL(zipBlob);
-            a.href = href;
-            a.download = `images_${Date.now()}.zip`;
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            setTimeout(() => URL.revokeObjectURL(href), 5000);
 
             setProgress(`Xong: ${ok} ok, ${fail} lỗi`);
         } catch (e) {
@@ -394,7 +454,7 @@
     }, true);
 
     panel.querySelector('#imgdl-rescan').addEventListener('click', scan);
-    panel.querySelector('#imgdl-download').addEventListener('click', downloadZip);
+    panel.querySelector('#imgdl-download').addEventListener('click', downloadAll);
 
     function scan() {
         allImages = collectImages();
