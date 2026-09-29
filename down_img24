@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Image Downloader MVP
 // @namespace    http://tampermonkey.net/
-// @version      2.3
-// @description  Quét ảnh, chọn, tải về / ZIP, settings, đa chọn, FAB đẹp, drag được
+// @version      2.4
+// @description  Quét ảnh, chọn, tải về / ZIP, settings, đa chọn, FAB đẹp, drag, log
 // @match        *://*/*
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
@@ -21,8 +21,9 @@
         delayMs: 250,
         formats: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'avif', 'svg', 'bmp', 'ico'],
         extraReferers: [],
-        fabPos: null,               // { x, y } viewport coords
-        panelPos: null,             // { x, y } viewport coords
+        fabPos: null,
+        panelPos: null,
+        logAutoScroll: true,
     };
 
     function loadSettings() {
@@ -40,6 +41,90 @@
     }
 
     let settings = loadSettings();
+
+    // ===== Logger =====
+    const MAX_LOGS = 500;
+    const logs = [];
+    let logContainer = null;
+    let logAutoScrollEl = null;
+
+    function log(level, ...args) {
+        const msg = args.map(a => {
+            if (typeof a === 'string') return a;
+            if (a instanceof Error) return a.message;
+            try { return JSON.stringify(a); } catch { return String(a); }
+        }).join(' ');
+
+        const entry = { ts: Date.now(), level, msg };
+        logs.push(entry);
+        if (logs.length > MAX_LOGS) logs.shift();
+
+        const consoleFn = level === 'error' ? console.error
+                        : level === 'warn'  ? console.warn
+                        : console.log;
+        try { consoleFn(`[imgdl:${level}]`, msg); } catch {}
+
+        if (logContainer) appendLogEntry(entry);
+    }
+
+    const logInfo    = (...a) => log('info', ...a);
+    const logSuccess = (...a) => log('success', ...a);
+    const logWarn    = (...a) => log('warn', ...a);
+    const logError   = (...a) => log('error', ...a);
+
+    function appendLogEntry(entry) {
+        if (!logContainer) return;
+        const row = document.createElement('div');
+        row.className = 'imgdl-log-row imgdl-log-' + entry.level;
+
+        const t = document.createElement('span');
+        t.className = 'imgdl-log-time';
+        const d = new Date(entry.ts);
+        t.textContent = d.toTimeString().slice(0, 8) + '.' +
+                        String(d.getMilliseconds()).padStart(3, '0');
+
+        const lv = document.createElement('span');
+        lv.className = 'imgdl-log-level';
+        lv.textContent = entry.level.toUpperCase();
+
+        const msg = document.createElement('span');
+        msg.className = 'imgdl-log-msg';
+        msg.textContent = entry.msg;
+
+        row.appendChild(t);
+        row.appendChild(lv);
+        row.appendChild(msg);
+        logContainer.appendChild(row);
+
+        while (logContainer.children.length > MAX_LOGS) {
+            logContainer.removeChild(logContainer.firstChild);
+        }
+
+        if (settings.logAutoScroll) {
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+    }
+
+    function renderAllLogs() {
+        if (!logContainer) return;
+        logContainer.innerHTML = '';
+        logs.forEach(appendLogEntry);
+    }
+
+    function exportLogs() {
+        const text = logs.map(e => {
+            const d = new Date(e.ts);
+            return `[${d.toISOString()}] [${e.level.toUpperCase()}] ${e.msg}`;
+        }).join('\n');
+        const blob = new Blob([text], { type: 'text/plain' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `imgdl_log_${Date.now()}.txt`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+    }
 
     // ===== JSZip lazy =====
     const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
@@ -136,7 +221,6 @@
         #imgdl-toggle.open::before,
         #imgdl-toggle.dragging::before { animation: none !important; opacity: 0 !important; }
 
-        /* Badge */
         #imgdl-badge {
             all: unset;
             position: absolute !important;
@@ -220,7 +304,6 @@
             align-items: center !important; position: relative !important;
         }
 
-        /* Multi-select menu */
         #imgdl-multi-menu {
             all: unset;
             position: absolute !important;
@@ -257,7 +340,6 @@
             background: #f0f0f0 !important;
         }
 
-        /* Tabs */
         #imgdl-tabs {
             display: flex !important; border-bottom: 1px solid #eee !important;
             background: #fafafa !important;
@@ -277,7 +359,6 @@
         .imgdl-page { display: none !important; flex-direction: column !important; flex: 1 1 auto !important; overflow: hidden !important; }
         .imgdl-page.active { display: flex !important; }
 
-        /* Images tab */
         #imgdl-list {
             flex: 1 1 auto !important; overflow-y: auto !important; padding: 8px !important;
             display: grid !important; grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
@@ -309,7 +390,6 @@
             text-align: center !important; color: #888 !important;
         }
 
-        /* Settings tab */
         #imgdl-settings {
             padding: 14px !important; overflow-y: auto !important;
             display: flex !important; flex-direction: column !important; gap: 16px !important;
@@ -413,7 +493,6 @@
             font-weight: 600 !important;
         }
 
-        /* Reset button */
         #imgdl-reset-pos {
             all: unset;
             padding: 7px 14px !important;
@@ -431,7 +510,75 @@
             background: #ececec !important;
         }
 
-        /* Footer */
+        /* Log */
+        .imgdl-log-controls {
+            display: flex !important; gap: 6px !important; align-items: center !important;
+            flex-wrap: wrap !important;
+        }
+        .imgdl-log-controls button {
+            all: unset;
+            padding: 5px 10px !important;
+            border-radius: 6px !important;
+            border: 1px solid #ccc !important;
+            background: #f5f5f5 !important;
+            cursor: pointer !important;
+            font-size: 11px !important;
+            font-weight: 600 !important;
+            box-sizing: border-box !important;
+            transition: background .15s ease !important;
+        }
+        .imgdl-log-controls button:hover {
+            background: #ececec !important;
+        }
+        .imgdl-log-autoscroll {
+            display: flex !important; align-items: center !important; gap: 4px !important;
+            font-size: 11px !important; cursor: pointer !important;
+            margin-left: auto !important; user-select: none !important;
+        }
+        .imgdl-log-autoscroll input {
+            margin: 0 !important; cursor: pointer !important;
+            accent-color: #667eea !important;
+        }
+        .imgdl-log-box {
+            height: 200px !important;
+            overflow-y: auto !important;
+            background: #1e1e1e !important;
+            color: #d4d4d4 !important;
+            border-radius: 8px !important;
+            padding: 8px !important;
+            font-family: 'SF Mono', Consolas, Monaco, monospace !important;
+            font-size: 11px !important;
+            line-height: 1.5 !important;
+            box-sizing: border-box !important;
+            border: 1px solid #333 !important;
+        }
+        .imgdl-log-row {
+            display: flex !important; gap: 6px !important;
+            padding: 1px 0 !important;
+            align-items: flex-start !important;
+            word-break: break-word !important;
+        }
+        .imgdl-log-time {
+            color: #666 !important; flex-shrink: 0 !important;
+        }
+        .imgdl-log-level {
+            flex-shrink: 0 !important;
+            font-weight: 700 !important;
+            min-width: 52px !important;
+        }
+        .imgdl-log-msg {
+            flex: 1 !important;
+            white-space: pre-wrap !important;
+            word-break: break-word !important;
+        }
+        .imgdl-log-info    .imgdl-log-level { color: #4fc3f7 !important; }
+        .imgdl-log-success .imgdl-log-level { color: #4caf50 !important; }
+        .imgdl-log-success .imgdl-log-msg   { color: #a5d6a7 !important; }
+        .imgdl-log-warn    .imgdl-log-level { color: #ffb74d !important; }
+        .imgdl-log-warn    .imgdl-log-msg   { color: #ffcc80 !important; }
+        .imgdl-log-error   .imgdl-log-level { color: #ef5350 !important; }
+        .imgdl-log-error   .imgdl-log-msg   { color: #ef9a9a !important; }
+
         #imgdl-footer {
             padding: 10px 14px !important; border-top: 1px solid #eee !important;
             display: flex !important; gap: 8px !important; align-items: center !important;
@@ -539,6 +686,21 @@
                     <button id="imgdl-reset-pos">Reset về mặc định</button>
                     <div class="imgdl-hint">Đưa nút và panel về góc dưới phải.</div>
                 </div>
+
+                <div class="imgdl-field">
+                    <label>Log hoạt động</label>
+                    <div class="imgdl-log-controls">
+                        <button id="imgdl-log-copy">Copy</button>
+                        <button id="imgdl-log-clear">Xoá</button>
+                        <button id="imgdl-log-export">Xuất .txt</button>
+                        <label class="imgdl-log-autoscroll">
+                            <input type="checkbox" id="imgdl-log-autoscroll" checked>
+                            Auto-scroll
+                        </label>
+                    </div>
+                    <div id="imgdl-log-box" class="imgdl-log-box"></div>
+                    <div class="imgdl-hint">Tối đa 500 dòng gần nhất.</div>
+                </div>
             </div>
         </div>
 
@@ -553,6 +715,47 @@
 
     document.body.appendChild(toggleBtn);
     document.body.appendChild(panel);
+
+    // ===== Init log system =====
+    logContainer = panel.querySelector('#imgdl-log-box');
+    logAutoScrollEl = panel.querySelector('#imgdl-log-autoscroll');
+    logAutoScrollEl.checked = settings.logAutoScroll;
+
+    logAutoScrollEl.addEventListener('change', () => {
+        settings.logAutoScroll = logAutoScrollEl.checked;
+        saveSettings(settings);
+        logInfo(`Auto-scroll log: ${settings.logAutoScroll ? 'ON' : 'OFF'}`);
+    });
+
+    panel.querySelector('#imgdl-log-copy').addEventListener('click', async () => {
+        const text = logs.map(e => {
+            const d = new Date(e.ts);
+            return `[${d.toTimeString().slice(0,8)}.${String(d.getMilliseconds()).padStart(3,'0')}] [${e.level.toUpperCase()}] ${e.msg}`;
+        }).join('\n');
+        try {
+            await navigator.clipboard.writeText(text);
+            logSuccess(`Đã copy ${logs.length} dòng log vào clipboard`);
+        } catch {
+            logWarn('Không copy được (thiếu quyền clipboard)');
+        }
+    });
+
+    panel.querySelector('#imgdl-log-clear').addEventListener('click', () => {
+        const n = logs.length;
+        logs.length = 0;
+        logContainer.innerHTML = '';
+        logInfo(`Đã xoá ${n} dòng log`);
+    });
+
+    panel.querySelector('#imgdl-log-export').addEventListener('click', () => {
+        exportLogs();
+        logSuccess(`Đã xuất file log (${logs.length} dòng)`);
+    });
+
+    renderAllLogs();
+    logInfo('=== Image Downloader khởi tạo ===');
+    logInfo(`URL: ${location.href}`);
+    logInfo(`UserAgent: ${navigator.userAgent}`);
 
     const selected = new Set();
     let allImages = [];
@@ -570,7 +773,6 @@
         el.style.setProperty('bottom', 'auto', 'important');
     }
 
-    // Apply vị trí FAB sau khi DOM có kích thước
     requestAnimationFrame(() => {
         applySavedPos(toggleBtn, settings.fabPos);
     });
@@ -586,7 +788,6 @@
         function onPointerDown(e) {
             if (e.button !== undefined && e.button !== 0) return;
 
-            // Bỏ qua khi bấm vào button/input bên trong handle
             const t = e.target;
             if (t && t.closest && t.closest('button, input, a, textarea, select')) return;
 
@@ -658,6 +859,7 @@
                 const rect = el.getBoundingClientRect();
                 settings[storageKey] = { x: rect.left, y: rect.top };
                 saveSettings(settings);
+                logInfo(`Lưu vị trí ${storageKey}: (${Math.round(rect.left)}, ${Math.round(rect.top)})`);
             }
 
             onDragEnd?.(moved);
@@ -666,7 +868,6 @@
         handleEl.addEventListener('pointerdown', onPointerDown);
     }
 
-    // Wire FAB
     makeDraggable(toggleBtn, toggleBtn, 'fabPos', {
         onDragStart: () => {
             toggleBtn.style.setProperty('transition', 'none', 'important');
@@ -680,7 +881,6 @@
         }
     });
 
-    // Wire Panel (qua header)
     const panelHeader = panel.querySelector('#imgdl-header');
     makeDraggable(panel, panelHeader, 'panelPos', {
         onDragStart: () => {},
@@ -714,44 +914,57 @@
 
     async function forceLoadImages() {
         const imgs = [...document.querySelectorAll('img')];
+        logInfo(`forceLoad: ${imgs.length} thẻ <img> trong DOM`);
+        let loaded = 0, failed = 0, patched = 0;
         for (const img of imgs) {
             const lazy = img.getAttribute('data-src')
                       || img.getAttribute('data-original')
                       || img.getAttribute('data-lazy-src');
             const currentSrc = img.currentSrc || img.src || '';
             if (lazy && lazy.startsWith('http') && (!currentSrc || currentSrc === 'about:blank')) {
-                try { img.src = lazy; } catch {}
+                try { img.src = lazy; patched++; } catch {}
             }
-            if (img.decode) { try { await img.decode(); } catch {} }
-            else if (!img.complete) {
+            if (img.decode) {
+                try { await img.decode(); loaded++; }
+                catch { failed++; }
+            } else if (!img.complete) {
                 await new Promise(r => {
                     img.addEventListener('load', r, { once: true });
                     img.addEventListener('error', r, { once: true });
                     setTimeout(r, 1500);
                 });
+                loaded++;
+            } else {
+                loaded++;
             }
         }
+        logInfo(`forceLoad xong: ${loaded} ok, ${failed} fail, ${patched} patch data-src`);
     }
 
     function collectImages() {
         const set = new Set();
         const allowed = new Set(settings.formats.map(f => f.toLowerCase()));
+        logInfo(`Filter định dạng: ${[...allowed].join(', ')}`);
+
+        let skippedSmall = 0, skippedExt = 0, skippedNoSrc = 0;
 
         document.querySelectorAll('img').forEach(img => {
             const w = img.naturalWidth || 0;
             const h = img.naturalHeight || 0;
-            if (w < MIN_SIZE || h < MIN_SIZE) return;
+            if (w < MIN_SIZE || h < MIN_SIZE) { skippedSmall++; return; }
 
             const real = pickRealSrc(img);
-            if (!real) return;
+            if (!real) { skippedNoSrc++; return; }
 
             let ext = getExt(real);
             if (ext === 'jpeg') ext = 'jpg';
-            if (ext && !allowed.has(ext)) return;
-            if (!ext && !allowed.has('jpg')) return;
+            if (ext && !allowed.has(ext)) { skippedExt++; return; }
+            if (!ext && !allowed.has('jpg')) { skippedExt++; return; }
 
             set.add(real);
         });
+
+        logInfo(`Bỏ qua: ${skippedSmall} quá nhỏ, ${skippedExt} sai định dạng, ${skippedNoSrc} không có src`);
         return [...set];
     }
 
@@ -846,24 +1059,38 @@
     }
 
     function fetchAsBlob(url) {
+        const ref = getRefererForUrl(url);
+        logInfo(`GET ${url}`);
+        logInfo(`  → Referer: ${ref}`);
         return new Promise((resolve, reject) => {
+            const t0 = performance.now();
             GM_xmlhttpRequest({
                 method: 'GET',
                 url,
                 responseType: 'blob',
                 headers: {
-                    'Referer': getRefererForUrl(url),
+                    'Referer': ref,
                     'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
                 },
                 onload: (res) => {
+                    const dt = Math.round(performance.now() - t0);
                     if (res.status >= 200 && res.status < 300 && res.response) {
+                        const size = res.response.size || 0;
+                        logSuccess(`OK ${res.status} — ${size}B (${dt}ms)`);
                         resolve(res.response);
                     } else {
+                        logError(`FAIL HTTP ${res.status} (${dt}ms)`);
                         reject(new Error('HTTP ' + res.status));
                     }
                 },
-                onerror: () => reject(new Error('network')),
-                ontimeout: () => reject(new Error('timeout')),
+                onerror: (e) => {
+                    logError(`Network error: ${e?.error || 'unknown'}`);
+                    reject(new Error('network'));
+                },
+                ontimeout: () => {
+                    logError('Timeout');
+                    reject(new Error('timeout'));
+                },
             });
         });
     }
@@ -880,26 +1107,33 @@
     }
 
     async function downloadBase(urls, onProgress) {
+        logInfo(`Bắt đầu tải ${urls.length} ảnh (mode: base, delay: ${settings.delayMs}ms)`);
         let ok = 0, fail = 0, idx = 0;
         for (const url of urls) {
             idx++;
             onProgress(`Đang tải ${idx}/${urls.length}...`);
             try {
                 const blob = await fetchAsBlob(url);
-                triggerBlobDownload(blob, guessFilename(url, idx));
+                const name = guessFilename(url, idx);
+                triggerBlobDownload(blob, name);
+                logSuccess(`Đã lưu: ${name}`);
                 ok++;
             } catch (e) {
-                console.warn('[imgdl] Fail:', url, e);
+                logError(`Bỏ qua: ${e.message}`);
                 fail++;
             }
             await new Promise(r => setTimeout(r, settings.delayMs));
         }
+        logInfo(`Kết thúc base: ${ok} ok, ${fail} fail`);
         return { ok, fail };
     }
 
     async function downloadZip(urls, onProgress) {
+        logInfo(`Bắt đầu tải ZIP ${urls.length} ảnh (delay: ${settings.delayMs}ms)`);
         onProgress('Đang load JSZip...');
+        logInfo('Đang load JSZip từ CDN...');
         const JSZip = await loadJSZip();
+        logSuccess('JSZip loaded');
         const zip = new JSZip();
 
         let ok = 0, fail = 0, idx = 0;
@@ -918,28 +1152,36 @@
                     let n = 1;
                     while (usedNames.has(`${base}_${n}${ext}`)) n++;
                     name = `${base}_${n}${ext}`;
+                    logWarn(`Trùng tên → đổi thành: ${name}`);
                 }
                 usedNames.add(name);
                 zip.file(name, blob);
+                logSuccess(`Đã thêm vào ZIP: ${name}`);
                 ok++;
             } catch (e) {
-                console.warn('[imgdl] Fail:', url, e);
+                logError(`Bỏ qua: ${e.message}`);
                 fail++;
             }
             await new Promise(r => setTimeout(r, settings.delayMs));
         }
 
         onProgress('Đang nén ZIP...');
+        logInfo('Đang nén ZIP...');
         const zipBlob = await zip.generateAsync({ type: 'blob' });
-        triggerBlobDownload(zipBlob, `images_${Date.now()}.zip`);
+        const zipName = `images_${Date.now()}.zip`;
+        logSuccess(`ZIP xong: ${zipName} (${zipBlob.size}B)`);
+        triggerBlobDownload(zipBlob, zipName);
+        logInfo(`Kết thúc ZIP: ${ok} ok, ${fail} fail`);
         return { ok, fail };
     }
 
     async function downloadSelected() {
         if (selected.size === 0) {
+            logWarn('Không có ảnh nào được chọn');
             alert('Chưa chọn ảnh nào');
             return;
         }
+        logInfo(`Bắt đầu tải: ${selected.size} ảnh, mode=${settings.downloadMode}`);
         const btn = panel.querySelector('#imgdl-download');
         btn.disabled = true;
 
@@ -952,7 +1194,9 @@
                 result = await downloadBase(urls, setProgress);
             }
             setProgress(`Xong: ${result.ok} ok, ${result.fail} lỗi`);
+            logSuccess(`Hoàn tất: ${result.ok} ok, ${result.fail} fail`);
         } catch (e) {
+            logError(`Lỗi tải: ${e.message}`);
             console.error(e);
             setProgress('Lỗi: ' + e.message);
         } finally {
@@ -984,8 +1228,10 @@
             cb.addEventListener('change', () => {
                 if (cb.checked) {
                     if (!settings.formats.includes(f)) settings.formats.push(f);
+                    logInfo(`Bật định dạng: .${f}`);
                 } else {
                     settings.formats = settings.formats.filter(x => x !== f);
+                    logInfo(`Tắt định dạng: .${f}`);
                 }
                 label.classList.toggle('on', cb.checked);
                 saveSettings(settings);
@@ -1017,8 +1263,10 @@
             btn.textContent = '✕';
             btn.title = 'Xoá';
             btn.addEventListener('click', () => {
+                const removed = settings.extraReferers[i];
                 settings.extraReferers.splice(i, 1);
                 saveSettings(settings);
+                logInfo(`Đã xoá Referer: ${removed}`);
                 renderRefererList();
             });
             row.appendChild(span);
@@ -1034,6 +1282,7 @@
         e.stopPropagation();
         const isOpen = panel.classList.toggle('open');
         toggleBtn.classList.toggle('open', isOpen);
+        logInfo(isOpen ? 'Mở panel' : 'Đóng panel');
         if (isOpen) {
             requestAnimationFrame(() => {
                 applySavedPos(panel, settings.panelPos);
@@ -1042,7 +1291,6 @@
         }
     }, true);
 
-    // Tabs
     panel.querySelectorAll('.imgdl-tab').forEach(tab => {
         tab.addEventListener('click', () => {
             const name = tab.dataset.tab;
@@ -1050,27 +1298,31 @@
             panel.querySelectorAll('.imgdl-page').forEach(p => {
                 p.classList.toggle('active', p.dataset.page === name);
             });
+            logInfo(`Chuyển tab: ${name}`);
         });
     });
 
-    // Mode toggle
     panel.querySelectorAll('#imgdl-mode button').forEach(b => {
         b.addEventListener('click', () => {
             settings.downloadMode = b.dataset.mode;
             saveSettings(settings);
+            logInfo(`Chế độ tải: ${settings.downloadMode}`);
             renderSettingsUI();
         });
     });
 
-    // Delay slider
     const delayEl = panel.querySelector('#imgdl-delay');
+    let delayDebounce = null;
     delayEl.addEventListener('input', () => {
         settings.delayMs = parseInt(delayEl.value, 10);
         panel.querySelector('#imgdl-delay-val').textContent = settings.delayMs + 'ms';
         saveSettings(settings);
+        clearTimeout(delayDebounce);
+        delayDebounce = setTimeout(() => {
+            logInfo(`Delay: ${settings.delayMs}ms`);
+        }, 500);
     });
 
-    // Referer add
     const refInput = panel.querySelector('#imgdl-referer-input');
     const refAddBtn = panel.querySelector('#imgdl-referer-add');
     function addReferer() {
@@ -1078,30 +1330,35 @@
         if (!v) return;
         if (!/^https?:\/\//i.test(v)) v = 'https://' + v;
         if (!v.endsWith('/')) v += '/';
-        try { new URL(v); } catch { alert('URL không hợp lệ'); return; }
+        try { new URL(v); } catch {
+            logError('Referer không hợp lệ: ' + v);
+            alert('URL không hợp lệ');
+            return;
+        }
         if (!settings.extraReferers.includes(v)) {
             settings.extraReferers.push(v);
             saveSettings(settings);
             renderRefererList();
+            logSuccess(`Đã thêm Referer: ${v}`);
+        } else {
+            logWarn(`Referer đã tồn tại: ${v}`);
         }
         refInput.value = '';
     }
     refAddBtn.addEventListener('click', addReferer);
     refInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') addReferer(); });
 
-    // Reset position
     panel.querySelector('#imgdl-reset-pos').addEventListener('click', () => {
         settings.fabPos = null;
         settings.panelPos = null;
         saveSettings(settings);
+        logInfo('Reset vị trí FAB + Panel');
 
-        // Reset FAB
         toggleBtn.style.removeProperty('left');
         toggleBtn.style.removeProperty('top');
         toggleBtn.style.setProperty('right', '24px', 'important');
         toggleBtn.style.setProperty('bottom', '24px', 'important');
 
-        // Reset panel
         panel.style.removeProperty('left');
         panel.style.removeProperty('top');
         panel.style.setProperty('right', '24px', 'important');
@@ -1137,13 +1394,16 @@
 
             if (action === 'all') {
                 allImages.forEach(u => selected.add(u));
+                logInfo(`Chọn tất cả: ${allImages.length} ảnh`);
             } else if (action === 'none') {
+                logInfo(`Bỏ chọn tất cả (trước: ${selected.size})`);
                 selected.clear();
             } else if (action === 'invert') {
                 allImages.forEach(u => {
                     if (selected.has(u)) selected.delete(u);
                     else selected.add(u);
                 });
+                logInfo(`Đảo chọn: giờ có ${selected.size} ảnh`);
             }
 
             panel.querySelectorAll('.imgdl-item').forEach(item => {
@@ -1155,22 +1415,34 @@
         }, true);
     });
 
-    // Rescan
-    panel.querySelector('#imgdl-rescan').addEventListener('click', scan);
-    // Download
+    panel.querySelector('#imgdl-rescan').addEventListener('click', () => {
+        logInfo('Người dùng bấm Quét lại');
+        scan();
+    });
     panel.querySelector('#imgdl-download').addEventListener('click', downloadSelected);
 
     async function scan() {
+        logInfo('=== Bắt đầu quét ảnh ===');
         setProgress('Đang quét...');
-        await forceLoadImages();
-        allImages = collectImages();
-        selected.clear();
-        allImages.forEach(u => selected.add(u));
+        const t0 = performance.now();
+        try {
+            await forceLoadImages();
+            allImages = collectImages();
+            selected.clear();
+            allImages.forEach(u => selected.add(u));
+            const dt = Math.round(performance.now() - t0);
+            logSuccess(`Quét xong: ${allImages.length} ảnh (${dt}ms)`);
+            if (allImages.length === 0) {
+                logWarn('Không tìm thấy ảnh nào khớp filter');
+            }
+        } catch (e) {
+            logError(`Lỗi khi quét: ${e.message}`);
+        }
         setProgress('');
         render();
     }
 
-    // ===== Window resize handler =====
+    // ===== Window resize =====
     window.addEventListener('resize', () => {
         if (settings.fabPos) {
             const rect = toggleBtn.getBoundingClientRect();
@@ -1190,6 +1462,14 @@
             settings.panelPos = { x, y };
             saveSettings(settings);
         }
+    });
+
+    // ===== Global error handlers =====
+    window.addEventListener('error', (e) => {
+        logError(`Uncaught: ${e.message} @ ${e.filename}:${e.lineno}`);
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+        logError(`Unhandled promise: ${e.reason?.message || e.reason}`);
     });
 
     // ===== Init =====
