@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Image Downloader MVP
 // @namespace    http://tampermonkey.net/
-// @version      2.7
-// @description  Quét ảnh, chọn, tải về / ZIP, settings, đa chọn, FAB đẹp, drag, log chi tiết
+// @version      2.8
+// @description  Quét ảnh, chọn, tải về / ZIP, retry lỗi, settings, đa chọn, FAB đẹp, drag, log chi tiết
 // @match        *://*/*
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
@@ -143,7 +143,7 @@
     }
 
     const MIN_SIZE = 100;
-    const LOAD_TIMEOUT = 3000;
+    const LOAD_TIMEOUT = 1000;   // 1s — không cần đợi lâu, URL đã có
 
     // ===== CSS =====
     const style = document.createElement('style');
@@ -585,6 +585,7 @@
         .imgdl-log-error   .imgdl-log-level { color: #ef5350 !important; }
         .imgdl-log-error   .imgdl-log-msg   { color: #ef9a9a !important; }
 
+        /* Footer */
         #imgdl-footer {
             padding: 10px 14px !important; border-top: 1px solid #eee !important;
             display: flex !important; gap: 8px !important; align-items: center !important;
@@ -594,6 +595,11 @@
         #imgdl-footer .imgdl-meta {
             display: flex !important; flex-direction: column !important;
             font-size: 11px !important; color: #555 !important;
+        }
+        .imgdl-footer-actions {
+            display: flex !important;
+            gap: 6px !important;
+            align-items: center !important;
         }
         #imgdl-footer button#imgdl-download {
             all: unset; padding: 8px 16px !important; border-radius: 8px !important;
@@ -616,6 +622,34 @@
             transform: none !important;
         }
         #imgdl-progress { color: #888 !important; }
+
+        /* Retry button */
+        #imgdl-retry {
+            all: unset;
+            padding: 8px 14px !important;
+            border-radius: 8px !important;
+            background: linear-gradient(135deg, #ff9800 0%, #f57c00 100%) !important;
+            color: #fff !important;
+            cursor: pointer !important;
+            font-size: 12px !important;
+            font-weight: 600 !important;
+            box-sizing: border-box !important;
+            box-shadow: 0 2px 8px rgba(255,152,0,.35) !important;
+            transition: transform .15s ease, box-shadow .15s ease !important;
+            display: none;
+        }
+        #imgdl-retry:hover {
+            transform: translateY(-1px) !important;
+            box-shadow: 0 4px 12px rgba(255,152,0,.5) !important;
+        }
+        #imgdl-retry:active {
+            transform: translateY(0) !important;
+        }
+        #imgdl-retry:disabled {
+            opacity: .5 !important;
+            cursor: not-allowed !important;
+            transform: none !important;
+        }
     `;
     document.head.appendChild(style);
 
@@ -715,7 +749,10 @@
                 <span id="imgdl-selected-count">Đã chọn: 0</span>
                 <span id="imgdl-progress"></span>
             </div>
-            <button id="imgdl-download">Tải về</button>
+            <div class="imgdl-footer-actions">
+                <button id="imgdl-retry">Tải lại lỗi (<span id="imgdl-retry-count">0</span>)</button>
+                <button id="imgdl-download">Tải về</button>
+            </div>
         </div>
     `;
 
@@ -765,6 +802,7 @@
 
     const selected = new Set();
     let allImages = [];
+    const failedUrls = new Set();   // URL fail ở lần tải gần nhất
 
     // ===== Apply saved positions =====
     function applySavedPos(el, pos) {
@@ -959,7 +997,6 @@
                       || img.getAttribute('data-lazy-src');
             const currentSrc = img.currentSrc || img.src || '';
 
-            // Patch src từ data-src nếu có
             if (lazy && lazy.startsWith('http') && (!currentSrc || currentSrc === 'about:blank')) {
                 try {
                     img.src = lazy;
@@ -970,19 +1007,13 @@
                 }
             }
 
-            // Đã load xong rồi → skip, không đợi
             if (img.complete) {
-                if (img.naturalWidth > 0) {
-                    already++;
-                    loaded++;
-                } else {
-                    failed++;
-                    logWarn(`#${i} đã complete nhưng naturalWidth=0 (lỗi 404/hỏng) — ${currentSrc}`);
-                }
+                if (img.naturalWidth > 0) { already++; loaded++; }
+                else { failed++; }
                 continue;
             }
 
-            // Chưa load xong → đợi tối đa LOAD_TIMEOUT
+            // Đợi tối đa LOAD_TIMEOUT, timeout không coi là fail cứng
             const result = await withTimeout(
                 new Promise(r => {
                     img.addEventListener('load', () => r('ok'), { once: true });
@@ -993,17 +1024,12 @@
             ).catch(() => 'timeout');
 
             if (result === 'ok') loaded++;
-            else if (result === 'error') {
-                failed++;
-                logWarn(`#${i} load fail (404/hỏng) — ${currentSrc}`);
-            } else {
-                timeout++;
-                logWarn(`#${i} load TIMEOUT (>${LOAD_TIMEOUT}ms) — ${currentSrc}`);
-            }
+            else if (result === 'error') failed++;
+            else timeout++;
         }
 
         const dt = Math.round(performance.now() - t0);
-        logInfo(`forceLoad: kết thúc — ${loaded} ok (${already} đã load sẵn), ${failed} fail, ${timeout} timeout, ${patched} patch (${dt}ms)`);
+        logInfo(`forceLoad: kết thúc — ${loaded} loaded (${already} sẵn), ${failed} fail, ${timeout} timeout, ${patched} patch (${dt}ms)`);
     }
 
     function collectImages() {
@@ -1014,15 +1040,23 @@
         const imgs = [...document.querySelectorAll('img')];
         logInfo(`Tổng cộng ${imgs.length} thẻ <img> trong DOM`);
 
-        let skippedSmall = 0, skippedExt = 0, skippedNoSrc = 0, dup = 0;
+        let skippedSmall = 0, skippedExt = 0, skippedNoSrc = 0, dup = 0, pending = 0;
 
         imgs.forEach((img, i) => {
             const w = img.naturalWidth || 0;
             const h = img.naturalHeight || 0;
             const rawSrc = img.currentSrc || img.src || '(none)';
 
-            if (w < MIN_SIZE || h < MIN_SIZE) {
-                logWarn(`#${i} SKIP size ${w}x${h} (min ${MIN_SIZE}) — ${rawSrc}`);
+            // Ảnh đã load và kích thước nhỏ → rác
+            if (w > 0 && h > 0 && (w < MIN_SIZE || h < MIN_SIZE)) {
+                logWarn(`#${i} SKIP size ${w}x${h} — ${rawSrc}`);
+                skippedSmall++;
+                return;
+            }
+
+            // Ảnh complete nhưng naturalWidth = 0 → 404/hỏng thật
+            if (img.complete && w === 0) {
+                logWarn(`#${i} SKIP ảnh lỗi (404) — ${rawSrc}`);
                 skippedSmall++;
                 return;
             }
@@ -1038,28 +1072,34 @@
             let extNorm = ext === 'jpeg' ? 'jpg' : ext;
 
             if (extNorm !== '?' && !allowed.has(extNorm)) {
-                logWarn(`#${i} SKIP .${extNorm} không nằm trong filter — ${real}`);
+                logWarn(`#${i} SKIP .${extNorm} — ${real}`);
                 skippedExt++;
                 return;
             }
             if (extNorm === '?' && !allowed.has('jpg')) {
-                logWarn(`#${i} SKIP URL không có đuôi và jpg bị tắt — ${real}`);
+                logWarn(`#${i} SKIP URL không đuôi — ${real}`);
                 skippedExt++;
                 return;
             }
 
             if (set.has(real)) {
-                logInfo(`#${i} DUP bỏ qua (đã có trong set) — ${real}`);
+                logInfo(`#${i} DUP — ${real}`);
                 dup++;
                 return;
             }
 
             set.add(real);
-            logSuccess(`#${i} ✓ ${w}x${h} .${extNorm} — ${real}`);
+
+            if (w === 0) {
+                pending++;
+                logSuccess(`#${i} ✓ [PENDING] .${extNorm} — ${real}`);
+            } else {
+                logSuccess(`#${i} ✓ ${w}x${h} .${extNorm} — ${real}`);
+            }
         });
 
-        logInfo(`→ Tổng kết: nhận ${set.size} / ${imgs.length} img`);
-        logInfo(`→ Bỏ qua: ${skippedSmall} quá nhỏ, ${skippedExt} sai định dạng, ${skippedNoSrc} không src, ${dup} trùng`);
+        logInfo(`→ Tổng kết: nhận ${set.size} / ${imgs.length} img (${pending} pending)`);
+        logInfo(`→ Bỏ qua: ${skippedSmall} lỗi/nhỏ, ${skippedExt} sai định dạng, ${skippedNoSrc} không src, ${dup} trùng`);
         return [...set];
     }
 
@@ -1137,6 +1177,18 @@
 
     function setProgress(text) {
         panel.querySelector('#imgdl-progress').textContent = text;
+    }
+
+    function updateRetryButton() {
+        const btn = panel.querySelector('#imgdl-retry');
+        const cnt = panel.querySelector('#imgdl-retry-count');
+        if (!btn || !cnt) return;
+        if (failedUrls.size > 0) {
+            cnt.textContent = failedUrls.size;
+            btn.style.setProperty('display', 'inline-block', 'important');
+        } else {
+            btn.style.setProperty('display', 'none', 'important');
+        }
     }
 
     // ===== Referer resolution =====
@@ -1221,9 +1273,11 @@
                 const name = guessFilename(url, n, contentType);
                 triggerBlobDownload(blob, name);
                 logSuccess(`Đã lưu file: ${name}`);
+                failedUrls.delete(url);
                 ok++;
             } catch (e) {
                 logError(`Bỏ qua ảnh #${n}: ${e.message}`);
+                failedUrls.add(url);
                 fail++;
             }
             await new Promise(r => setTimeout(r, settings.delayMs));
@@ -1231,6 +1285,7 @@
 
         const dt = Math.round(performance.now() - t0);
         logInfo(`=== Kết thúc base: ${ok} ok, ${fail} fail, tổng ${dt}ms ===`);
+        updateRetryButton();
         return { ok, fail };
     }
 
@@ -1267,9 +1322,11 @@
                 usedNames.add(name);
                 zip.file(name, blob);
                 logSuccess(`Đã thêm vào ZIP: ${name}`);
+                failedUrls.delete(url);
                 ok++;
             } catch (e) {
                 logError(`Bỏ qua ảnh #${n}: ${e.message}`);
+                failedUrls.add(url);
                 fail++;
             }
             await new Promise(r => setTimeout(r, settings.delayMs));
@@ -1283,6 +1340,7 @@
         logSuccess(`ZIP xong: ${zipName} (${fmtSize(zipBlob.size)}) trong ${dt}ms`);
         triggerBlobDownload(zipBlob, zipName);
         logInfo(`=== Kết thúc ZIP: ${ok} ok, ${fail} fail ===`);
+        updateRetryButton();
         return { ok, fail };
     }
 
@@ -1309,6 +1367,37 @@
         } catch (e) {
             logError(`Lỗi tải: ${e.message}`);
             console.error(e);
+            setProgress('Lỗi: ' + e.message);
+        } finally {
+            btn.disabled = false;
+            setTimeout(() => setProgress(''), 4000);
+        }
+    }
+
+    async function retryFailed() {
+        if (failedUrls.size === 0) {
+            logWarn('Không có ảnh nào bị lỗi để tải lại');
+            return;
+        }
+        const urls = [...failedUrls];
+        logInfo(`=== Tải lại ${urls.length} ảnh bị lỗi ===`);
+
+        const btn = panel.querySelector('#imgdl-retry');
+        btn.disabled = true;
+
+        failedUrls.clear();
+
+        try {
+            let result;
+            if (settings.downloadMode === 'zip') {
+                result = await downloadZip(urls, setProgress);
+            } else {
+                result = await downloadBase(urls, setProgress);
+            }
+            setProgress(`Tải lại xong: ${result.ok} ok, ${result.fail} lỗi`);
+            logSuccess(`Tải lại hoàn tất: ${result.ok} ok, ${result.fail} fail`);
+        } catch (e) {
+            logError(`Lỗi tải lại: ${e.message}`);
             setProgress('Lỗi: ' + e.message);
         } finally {
             btn.disabled = false;
@@ -1531,10 +1620,13 @@
         scan();
     });
     panel.querySelector('#imgdl-download').addEventListener('click', downloadSelected);
+    panel.querySelector('#imgdl-retry').addEventListener('click', retryFailed);
 
     async function scan() {
         logInfo('=== Bắt đầu quét ảnh ===');
         setProgress('Đang quét...');
+        failedUrls.clear();
+        updateRetryButton();
         const t0 = performance.now();
         try {
             await forceLoadImages();
@@ -1585,4 +1677,5 @@
 
     // ===== Init =====
     renderSettingsUI();
+    updateRetryButton();
 })();
